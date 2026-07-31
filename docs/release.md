@@ -13,6 +13,13 @@ it public, publish packages, create tags, or create Releases.
    `next`, verify them, then publish the root prerelease.
 6. Configure the exact `release.yml` GitHub Actions Trusted Publisher on
    every existing package.
+7. On every package's npm Settings page, set Publishing access to
+   `Require two-factor authentication and disallow tokens`. The CLI
+   `mfa=publish` mode is not a substitute for this token restriction.
+8. From an authenticated maintainer terminal, run `npm run trust:check` and
+   complete the single npm proof-of-presence flow if requested. The release
+   workflow intentionally carries no account token, so this registry-authority
+   check must pass before the stable tag is created.
 
 Empty reservation packages and stored npm automation tokens are prohibited.
 

@@ -104,7 +104,7 @@
 
 - [x] 12.1 With separate authorization, create a private remote repository and run CI without publishing, pushing tags, creating Releases, or changing visibility.
 - [x] 12.2 Run the whole-tree and candidate-history scrub plus human review; with separate authorization, make the repository public before any provenance-bearing publication.
-- [ ] 12.3 Immediately recheck all five npm names; with separate interactive publication authorization, publish and verify functional `0.1.0-rc.0` platform packages under `next`, then publish and verify the root prerelease using account 2FA and no stored automation token.
-- [ ] 12.4 Configure and verify one exact Trusted Publisher for each existing npm package before preparing the stable tag.
+- [x] 12.3 Immediately recheck all five npm names; with separate interactive publication authorization, publish and verify functional `0.1.0-rc.0` platform packages under `next`, then publish and verify the root prerelease using account 2FA and no stored automation token.
+- [x] 12.4 Configure and verify one exact Trusted Publisher for each existing npm package before preparing the stable tag.
 - [ ] 12.5 With separate stable-release authorization, publish `v0.1.0` platform packages then root through OIDC, create the matching GitHub Release, and verify provenance, versions, dist-tags, checksums, clean installation, update, and uninstall.
 - [ ] 12.6 Only after stable private validation, migrate any external private compatibility adapter under a separate local-operation authorization and retain a reversible backup outside the public repository.

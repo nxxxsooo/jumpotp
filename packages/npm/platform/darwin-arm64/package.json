@@ -19,6 +19,9 @@
   "files": [
     "bin/jumpotp"
   ],
+  "scripts": {
+    "prepublishOnly": "cd ../../../.. && npm run check && npm run packages:audit && ./scripts/scrub.sh"
+  },
   "publishConfig": {
     "access": "public",
     "provenance": true

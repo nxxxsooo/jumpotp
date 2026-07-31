@@ -11,6 +11,7 @@
     "check": "make check",
     "packages:prepare": "node scripts/prepare-packages.mjs",
     "packages:audit": "node scripts/audit-packages.mjs",
-    "packages:test": "node scripts/test-packages.mjs"
+    "packages:test": "node scripts/test-packages.mjs",
+    "trust:check": "node scripts/check-trust.mjs"
   }
 }

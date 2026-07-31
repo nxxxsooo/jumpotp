@@ -21,6 +21,9 @@
     "bin/jumpotp.js",
     "README.md"
   ],
+  "scripts": {
+    "prepublishOnly": "cd ../../.. && npm run check && npm run packages:audit && ./scripts/scrub.sh"
+  },
   "optionalDependencies": {
     "jumpotp-darwin-arm64": "0.1.0-rc.0",
     "jumpotp-darwin-x64": "0.1.0-rc.0",
