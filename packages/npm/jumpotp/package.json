@@ -1,0 +1,34 @@
+{
+  "name": "jumpotp",
+  "version": "0.1.0-dev",
+  "description": "Safely assist authorized interactive SSH TOTP prompts",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nxxxsooo/jumpotp.git"
+  },
+  "homepage": "https://github.com/nxxxsooo/jumpotp#readme",
+  "bugs": {
+    "url": "https://github.com/nxxxsooo/jumpotp/issues"
+  },
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "bin": {
+    "jumpotp": "bin/jumpotp.js"
+  },
+  "files": [
+    "bin/jumpotp.js",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "jumpotp-darwin-arm64": "0.1.0-dev",
+    "jumpotp-darwin-x64": "0.1.0-dev",
+    "jumpotp-linux-arm64": "0.1.0-dev",
+    "jumpotp-linux-x64": "0.1.0-dev"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

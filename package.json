@@ -1,0 +1,16 @@
+{
+  "name": "jumpotp-monorepo",
+  "private": true,
+  "version": "0.1.0-dev",
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "scripts": {
+    "build": "./scripts/build.sh",
+    "test": "go test ./...",
+    "check": "make check",
+    "packages:prepare": "node scripts/prepare-packages.mjs",
+    "packages:audit": "node scripts/audit-packages.mjs",
+    "packages:test": "node scripts/test-packages.mjs"
+  }
+}

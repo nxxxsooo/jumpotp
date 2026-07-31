@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: darwin-arm64
+          - os: macos-13
+            target: darwin-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: ubuntu-latest
+            target: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+      - run: go test ./...
+      - run: ./scripts/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/jumpotp-${{ matrix.target }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          cache: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+      - run: npm install --global npm@^11.5.1
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+      - run: |
+          mkdir -p dist
+          cp downloaded/darwin-arm64/jumpotp-darwin-arm64 dist/
+          cp downloaded/darwin-x64/jumpotp-darwin-x64 dist/
+          cp downloaded/linux-arm64/jumpotp-linux-arm64 dist/
+          cp downloaded/linux-x64/jumpotp-linux-x64 dist/
+          chmod 755 dist/jumpotp-*
+      - run: node scripts/check-release.mjs
+      - run: node scripts/prepare-packages.mjs
+      - run: node scripts/audit-packages.mjs
+      - run: ./scripts/scrub.sh
+      - name: Publish platform packages
+        run: |
+          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+            (cd "packages/npm/platform/$target" && npm publish --access public)
+            test "$(npm view "jumpotp-$target" version)" = "$(cat VERSION)"
+          done
+      - name: Publish root package last
+        run: |
+          (cd packages/npm/jumpotp && npm publish --access public)
+          test "$(npm view jumpotp version)" = "$(cat VERSION)"
+      - name: Create checksum manifest
+        run: |
+          cd dist
+          sha256sum jumpotp-* > SHA256SUMS
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/jumpotp-* dist/SHA256SUMS --generate-notes --verify-tag

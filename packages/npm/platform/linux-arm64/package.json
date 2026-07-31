@@ -1,0 +1,26 @@
+{
+  "name": "jumpotp-linux-arm64",
+  "version": "0.1.0-dev",
+  "description": "JumpOTP native binary for Linux arm64",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nxxxsooo/jumpotp.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "bin": {
+    "jumpotp-native": "bin/jumpotp"
+  },
+  "files": [
+    "bin/jumpotp"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

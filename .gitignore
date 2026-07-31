@@ -1,0 +1,7 @@
+/dist/
+/coverage/
+/node_modules/
+/packages/npm/platform/*/bin/
+*.test
+*.out
+.DS_Store
