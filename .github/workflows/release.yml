@@ -72,14 +72,29 @@ jobs:
       - run: ./scripts/scrub.sh
       - name: Publish platform packages
         run: |
+          version="$(cat VERSION)"
           for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
-            (cd "packages/npm/platform/$target" && npm publish --access public)
-            test "$(npm view "jumpotp-$target" version)" = "$(cat VERSION)"
+            package="jumpotp-$target"
+            if test "$(npm view "$package@$version" version 2>/dev/null || true)" != "$version"; then
+              (cd "packages/npm/platform/$target" && npm publish --access public)
+            fi
+            for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+              test "$(npm view "$package@$version" version 2>/dev/null || true)" = "$version" && break
+              test "$attempt" -lt 12 || exit 1
+              sleep 5
+            done
           done
       - name: Publish root package last
         run: |
-          (cd packages/npm/jumpotp && npm publish --access public)
-          test "$(npm view jumpotp version)" = "$(cat VERSION)"
+          version="$(cat VERSION)"
+          if test "$(npm view "jumpotp@$version" version 2>/dev/null || true)" != "$version"; then
+            (cd packages/npm/jumpotp && npm publish --access public)
+          fi
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            test "$(npm view "jumpotp@$version" version 2>/dev/null || true)" = "$version" && break
+            test "$attempt" -lt 12 || exit 1
+            sleep 5
+          done
       - name: Create checksum manifest
         run: |
           cd dist
