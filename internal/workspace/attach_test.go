@@ -102,7 +102,7 @@ func containsArg(args []string, value string) bool {
 
 func useShortAttachRuntime(t *testing.T) {
 	t.Helper()
-	base, err := os.MkdirTemp("/private/tmp", "jotp-attach-")
+	base, err := os.MkdirTemp("/tmp", "jotp-attach-")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -125,7 +125,7 @@ func TestUsageErrors(t *testing.T) {
 }
 
 func TestStatusJSONWithNoWorkspaceServer(t *testing.T) {
-	runtimeBase, err := os.MkdirTemp("/private/tmp", "jotp-cli-")
+	runtimeBase, err := os.MkdirTemp("/tmp", "jotp-cli-")
 	if err != nil {
 		t.Fatal(err)
 	}

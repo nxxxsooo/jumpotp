@@ -313,7 +313,7 @@ func sampleConfig(t *testing.T) *config.Config {
 
 func useShortRuntimeDir(t *testing.T) {
 	t.Helper()
-	base, err := os.MkdirTemp("/private/tmp", "jotp-")
+	base, err := os.MkdirTemp("/tmp", "jotp-")
 	if err != nil {
 		t.Fatal(err)
 	}

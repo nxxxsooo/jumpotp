@@ -86,7 +86,10 @@ func Connect(ctx context.Context, options Options) Result {
 	waitCh := make(chan error, 1)
 	providerCh := make(chan providerResult, 1)
 
-	go readChunks(ptmx, outputCh, outputErrCh)
+	go func() {
+		readChunks(ptmx, outputCh, outputErrCh)
+		close(outputCh)
+	}()
 	go readChunks(options.In, inputCh, inputErrCh)
 	go func() { waitCh <- command.Wait() }()
 
@@ -105,6 +108,7 @@ func Connect(ctx context.Context, options Options) Result {
 	manualMode := false
 	manualBuffer := make([]byte, 0, 16)
 	interrupted := false
+	var completed *Result
 	var finishOnce sync.Once
 	finish := func() {
 		finishOnce.Do(func() {
@@ -152,7 +156,14 @@ func Connect(ctx context.Context, options Options) Result {
 			if command.Process != nil {
 				_ = command.Process.Signal(sig)
 			}
-		case value := <-outputCh:
+		case value, ok := <-outputCh:
+			if !ok {
+				outputCh = nil
+				if completed != nil {
+					return *completed
+				}
+				continue
+			}
 			if len(value) == 0 {
 				continue
 			}
@@ -318,19 +329,28 @@ func Connect(ctx context.Context, options Options) Result {
 				fmt.Fprintf(options.Err, "jumpotp: terminal input ended: %v\n", readErr)
 			}
 		case waitErr := <-waitCh:
-			if interrupted {
-				return Result{ExitCode: 130, Err: context.Canceled}
+			result := childResult(waitErr, interrupted)
+			completed = &result
+			waitCh = nil
+			if outputCh == nil {
+				return result
 			}
-			if waitErr == nil {
-				return Result{ExitCode: 0}
-			}
-			var exitError *exec.ExitError
-			if errors.As(waitErr, &exitError) {
-				return Result{ExitCode: exitError.ExitCode(), Err: waitErr}
-			}
-			return Result{ExitCode: 4, Err: waitErr}
 		}
 	}
+}
+
+func childResult(waitErr error, interrupted bool) Result {
+	if interrupted {
+		return Result{ExitCode: 130, Err: context.Canceled}
+	}
+	if waitErr == nil {
+		return Result{ExitCode: 0}
+	}
+	var exitError *exec.ExitError
+	if errors.As(waitErr, &exitError) {
+		return Result{ExitCode: exitError.ExitCode(), Err: waitErr}
+	}
+	return Result{ExitCode: 4, Err: waitErr}
 }
 
 func readChunks(reader io.Reader, values chan<- []byte, errorsOut chan<- error) {

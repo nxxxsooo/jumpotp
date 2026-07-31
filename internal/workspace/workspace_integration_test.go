@@ -163,7 +163,7 @@ func requireTmux(t *testing.T) {
 
 func useWorkspaceRuntime(t *testing.T) {
 	t.Helper()
-	base, err := os.MkdirTemp("/private/tmp", "jotp-ws-")
+	base, err := os.MkdirTemp("/tmp", "jotp-ws-")
 	if err != nil {
 		t.Fatal(err)
 	}
