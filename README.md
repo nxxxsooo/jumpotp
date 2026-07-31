@@ -1,4 +1,24 @@
-# JumpOTP
+<p align="center">
+  <a href="#jumpotp">English</a> · <a href="docs/zh-CN.md">简体中文</a>
+</p>
+
+![JumpOTP. A short-lived OTP signal crossing a controlled SSH boundary.](docs/assets/jumpotp-hero.webp)
+
+<h1 id="jumpotp" align="center">JumpOTP</h1>
+
+<p align="center"><strong>One prompt. One code. One authorized SSH session.</strong></p>
+
+<p align="center">
+  <a href="https://github.com/nxxxsooo/jumpotp/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/nxxxsooo/jumpotp/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://www.npmjs.com/package/jumpotp"><img alt="npm" src="https://img.shields.io/npm/v/jumpotp?label=npm"></a>
+  <a href="https://github.com/nxxxsooo/jumpotp/blob/main/LICENSE"><img alt="Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-c27a18"></a>
+</p>
+
+<p align="center">
+  <a href="https://mjshao.fun/jumpotp/">Website</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#threat-model">Threat model</a>
+</p>
 
 JumpOTP assists **authorized interactive SSH sessions** that request a
 time-based one-time password (TOTP). It observes a narrow configured prompt,
@@ -13,8 +33,6 @@ configuration or ControlMaster lifetime.
 > factor separation matters.
 
 ## Install
-
-After the first public release:
 
 ```sh
 npm install -g jumpotp
