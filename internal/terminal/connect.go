@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/creack/pty"
@@ -36,8 +37,23 @@ type Result struct {
 }
 
 type providerResult struct {
-	code []byte
-	err  error
+	generation uint64
+	code       []byte
+	err        error
+}
+
+type terminalInputMode int32
+
+const (
+	inputProxy terminalInputMode = iota
+	inputSuppressed
+	inputManual
+	maxManualCodeBytes = 64
+)
+
+type terminalInput struct {
+	value []byte
+	mode  terminalInputMode
 }
 
 func Connect(ctx context.Context, options Options) Result {
@@ -81,16 +97,17 @@ func Connect(ctx context.Context, options Options) Result {
 
 	outputCh := make(chan []byte, 16)
 	outputErrCh := make(chan error, 1)
-	inputCh := make(chan []byte, 16)
+	inputCh := make(chan terminalInput, 16)
 	inputErrCh := make(chan error, 1)
 	waitCh := make(chan error, 1)
 	providerCh := make(chan providerResult, 1)
+	var currentInputMode atomic.Int32
 
 	go func() {
 		readChunks(ptmx, outputCh, outputErrCh)
 		close(outputCh)
 	}()
-	go readChunks(options.In, inputCh, inputErrCh)
+	go readInputChunks(options.In, inputCh, inputErrCh, isTTY, &currentInputMode)
 	go func() { waitCh <- command.Wait() }()
 
 	signals := make(chan os.Signal, 4)
@@ -99,6 +116,7 @@ func Connect(ctx context.Context, options Options) Result {
 
 	autoUsed := false
 	providerPending := false
+	var providerGeneration uint64
 	var providerCancel context.CancelFunc
 	defer func() {
 		if providerCancel != nil {
@@ -107,6 +125,7 @@ func Connect(ctx context.Context, options Options) Result {
 	}()
 	manualMode := false
 	manualBuffer := make([]byte, 0, 16)
+	defer func() { mfa.Zero(manualBuffer) }()
 	interrupted := false
 	var completed *Result
 	var finishOnce sync.Once
@@ -132,9 +151,15 @@ func Connect(ctx context.Context, options Options) Result {
 			}
 			rawActive = false
 		}
-		fmt.Fprintf(options.Out, "\r\nJumpOTP: %s. Enter the code manually (digits are visible): ", reason)
+		currentInputMode.Store(int32(inputSuppressed))
+		if err := flushTerminalInput(fd); err != nil {
+			return fmt.Errorf("discard input queued before manual fallback: %w", err)
+		}
 		manualMode = true
+		mfa.Zero(manualBuffer)
 		manualBuffer = manualBuffer[:0]
+		currentInputMode.Store(int32(inputManual))
+		fmt.Fprintf(options.Out, "\r\nJumpOTP: %s. Enter the code manually (digits are visible): ", reason)
 		return nil
 	}
 
@@ -193,12 +218,19 @@ func Connect(ctx context.Context, options Options) Result {
 				}
 				continue
 			}
+			currentInputMode.Store(int32(inputSuppressed))
+			providerGeneration++
+			generation := providerGeneration
 			providerPending = true
-			go func(item string) {
+			go func(item string, generation uint64) {
 				code, codeErr := options.Source.Code(ctx, item)
-				providerCh <- providerResult{code: code, err: codeErr}
-			}(options.Target.Item)
+				providerCh <- providerResult{generation: generation, code: code, err: codeErr}
+			}(options.Target.Item, generation)
 		case result := <-providerCh:
+			if result.generation != providerGeneration || !providerPending {
+				mfa.Zero(result.code)
+				continue
+			}
 			providerPending = false
 			if result.err != nil {
 				if awaiting, ok := options.Source.(provider.AwaitingSource); ok && !manualMode {
@@ -213,11 +245,13 @@ func Connect(ctx context.Context, options Options) Result {
 						awaitCtx, cancelAwait = context.WithCancel(ctx)
 						providerCancel = cancelAwait
 						defer cancelAwait()
+						providerGeneration++
+						generation := providerGeneration
 						providerPending = true
-						go func(item string) {
+						go func(item string, generation uint64) {
 							code, codeErr := awaiting.AwaitCode(awaitCtx, item)
-							providerCh <- providerResult{code: code, err: codeErr}
-						}(options.Target.Item)
+							providerCh <- providerResult{generation: generation, code: code, err: codeErr}
+						}(options.Target.Item, generation)
 						continue
 					}
 				}
@@ -239,6 +273,7 @@ func Connect(ctx context.Context, options Options) Result {
 				continue
 			}
 			if manualMode {
+				currentInputMode.Store(int32(inputSuppressed))
 				manualMode = false
 				mfa.Zero(manualBuffer)
 				manualBuffer = manualBuffer[:0]
@@ -261,8 +296,36 @@ func Connect(ctx context.Context, options Options) Result {
 			}
 			autoUsed = true
 			matcher.Reset()
-		case value := <-inputCh:
+			currentInputMode.Store(int32(inputProxy))
+		case input := <-inputCh:
+			value := input.value
 			if len(value) == 0 {
+				continue
+			}
+			switch input.mode {
+			case inputSuppressed:
+				if err := forwardPendingControls(ptmx, value); err != nil {
+					return Result{ExitCode: childExitCode(command.ProcessState), Err: err}
+				}
+				continue
+			case inputManual:
+				if !manualMode {
+					mfa.Zero(value)
+					continue
+				}
+			case inputProxy:
+				if manualMode || providerPending {
+					if err := forwardPendingControls(ptmx, value); err != nil {
+						return Result{ExitCode: childExitCode(command.ProcessState), Err: err}
+					}
+					continue
+				}
+				if _, err := ptmx.Write(value); err != nil {
+					return Result{ExitCode: childExitCode(command.ProcessState), Err: err}
+				}
+				continue
+			default:
+				mfa.Zero(value)
 				continue
 			}
 			if !manualMode {
@@ -272,53 +335,69 @@ func Connect(ctx context.Context, options Options) Result {
 				continue
 			}
 			manualBuffer = append(manualBuffer, value...)
-			if len(manualBuffer) > 64 {
-				fmt.Fprint(options.Out, "\r\nJumpOTP: manual code is too long. Try again: ")
-				manualBuffer = manualBuffer[:0]
-				continue
-			}
-			lineEnd := bytes.IndexAny(manualBuffer, "\r\n")
-			if lineEnd < 0 {
-				continue
-			}
-			code := append([]byte(nil), manualBuffer[:lineEnd]...)
-			remainderStart := lineEnd + 1
-			if manualBuffer[lineEnd] == '\r' && remainderStart < len(manualBuffer) && manualBuffer[remainderStart] == '\n' {
-				remainderStart++
-			}
-			remainder := append([]byte(nil), manualBuffer[remainderStart:]...)
-			manualBuffer = manualBuffer[:0]
-			if err := mfa.ValidateCode(code, options.Target.MFA); err != nil {
-				mfa.Zero(code)
-				fmt.Fprintf(options.Out, "\r\nJumpOTP: %s. Try again: ", err)
-				continue
-			}
-			if providerCancel != nil {
-				providerCancel()
-				providerCancel = nil
-				providerPending = false
-			}
-			payload := append(code, '\n')
-			_, writeErr := ptmx.Write(payload)
-			mfa.Zero(payload)
-			mfa.Zero(code)
-			if writeErr != nil {
-				finish()
-				return Result{ExitCode: 4, Err: fmt.Errorf("submit manual code: %w", writeErr)}
-			}
-			manualMode = false
-			autoUsed = true
-			matcher.Reset()
-			if isTTY {
-				if _, err := term.MakeRaw(fd); err != nil {
-					finish()
-					return Result{ExitCode: 4, Err: fmt.Errorf("restore proxy terminal mode: %w", err)}
+			for manualMode {
+				lineEnd := bytes.IndexAny(manualBuffer, "\r\n")
+				if lineEnd < 0 {
+					if len(manualBuffer) > maxManualCodeBytes {
+						mfa.Zero(manualBuffer)
+						manualBuffer = manualBuffer[:0]
+						fmt.Fprint(options.Out, "\r\nJumpOTP: manual code is too long. Try again: ")
+					}
+					break
 				}
-				rawActive = true
-			}
-			if len(remainder) > 0 {
-				_, _ = ptmx.Write(remainder)
-				mfa.Zero(remainder)
+				remainderStart := lineEnd + 1
+				if manualBuffer[lineEnd] == '\r' && remainderStart < len(manualBuffer) && manualBuffer[remainderStart] == '\n' {
+					remainderStart++
+				}
+				tooLong := lineEnd > maxManualCodeBytes
+				var code []byte
+				if !tooLong {
+					code = append([]byte(nil), manualBuffer[:lineEnd]...)
+				}
+				remaining := len(manualBuffer) - remainderStart
+				copy(manualBuffer, manualBuffer[remainderStart:])
+				mfa.Zero(manualBuffer[remaining:])
+				manualBuffer = manualBuffer[:remaining]
+				if tooLong {
+					fmt.Fprint(options.Out, "\r\nJumpOTP: manual code is too long. Try again: ")
+					continue
+				}
+				if err := mfa.ValidateCode(code, options.Target.MFA); err != nil {
+					mfa.Zero(code)
+					fmt.Fprintf(options.Out, "\r\nJumpOTP: %s. Try again: ", err)
+					continue
+				}
+				if providerCancel != nil {
+					providerGeneration++
+					providerCancel()
+					providerCancel = nil
+					providerPending = false
+				}
+				currentInputMode.Store(int32(inputSuppressed))
+				payload := append(code, '\n')
+				_, writeErr := ptmx.Write(payload)
+				mfa.Zero(payload)
+				mfa.Zero(code)
+				if writeErr != nil {
+					finish()
+					return Result{ExitCode: 4, Err: fmt.Errorf("submit manual code: %w", writeErr)}
+				}
+				manualMode = false
+				autoUsed = true
+				matcher.Reset()
+				if isTTY {
+					if _, err := term.MakeRaw(fd); err != nil {
+						finish()
+						return Result{ExitCode: 4, Err: fmt.Errorf("restore proxy terminal mode: %w", err)}
+					}
+					rawActive = true
+				}
+				if len(manualBuffer) > 0 {
+					_, _ = ptmx.Write(manualBuffer)
+					mfa.Zero(manualBuffer)
+					manualBuffer = manualBuffer[:0]
+				}
+				currentInputMode.Store(int32(inputProxy))
 			}
 		case readErr := <-outputErrCh:
 			if readErr != nil && !errors.Is(readErr, io.EOF) && !isClosedPTY(readErr) {
@@ -366,6 +445,48 @@ func readChunks(reader io.Reader, values chan<- []byte, errorsOut chan<- error) 
 			return
 		}
 	}
+}
+
+func readInputChunks(reader io.Reader, values chan<- terminalInput, errorsOut chan<- error, retryEOF bool, mode *atomic.Int32) {
+	buffer := make([]byte, 4096)
+	previousReadWasEOF := false
+	for {
+		count, err := reader.Read(buffer)
+		if count > 0 {
+			value := append([]byte(nil), buffer[:count]...)
+			values <- terminalInput{value: value, mode: terminalInputMode(mode.Load())}
+			previousReadWasEOF = false
+		}
+		if err == nil {
+			continue
+		}
+		if retryEOF && errors.Is(err, io.EOF) {
+			if previousReadWasEOF {
+				errorsOut <- err
+				return
+			}
+			previousReadWasEOF = true
+			continue
+		}
+		errorsOut <- err
+		return
+	}
+}
+
+func forwardPendingControls(writer io.Writer, value []byte) error {
+	controls := value[:0]
+	for _, current := range value {
+		switch current {
+		case 0x03, 0x1a, 0x1c:
+			controls = append(controls, current)
+		}
+	}
+	var err error
+	if len(controls) > 0 {
+		_, err = writer.Write(controls)
+	}
+	mfa.Zero(value)
+	return err
 }
 
 func childExitCode(state *os.ProcessState) int {

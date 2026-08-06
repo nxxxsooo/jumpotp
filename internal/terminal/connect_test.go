@@ -29,6 +29,13 @@ type reconnectingSource struct {
 	canceled  chan struct{}
 }
 
+type delayedSource struct {
+	started chan struct{}
+	release chan struct{}
+	code    string
+	err     error
+}
+
 func (s *reconnectingSource) Code(context.Context, string) ([]byte, error) {
 	return nil, &provider.Error{Kind: provider.Unavailable}
 }
@@ -39,6 +46,19 @@ func (s *reconnectingSource) AwaitCode(ctx context.Context, _ string) ([]byte, e
 		return []byte("135790"), nil
 	case <-ctx.Done():
 		close(s.canceled)
+		return nil, ctx.Err()
+	}
+}
+
+func (s *delayedSource) Code(ctx context.Context, _ string) ([]byte, error) {
+	close(s.started)
+	select {
+	case <-s.release:
+		if s.err != nil {
+			return nil, s.err
+		}
+		return []byte(s.code), nil
+	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
@@ -175,6 +195,78 @@ exit 7
 	}
 }
 
+func TestInputWhileAutomaticCodeIsPendingDoesNotCorruptSubmission(t *testing.T) {
+	bin := t.TempDir()
+	writeScript(t, filepath.Join(bin, "ssh"), `#!/bin/sh
+printf 'Enter 6-digit verification code: '
+IFS= read code
+if [ "$code" = "246810" ]; then
+  printf '\nAUTH_OK\n'
+  exit 0
+fi
+printf '\nAUTH_FAILED\n'
+exit 9
+`)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	localMaster, localTTY, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localMaster.Close()
+	defer localTTY.Close()
+	source := &delayedSource{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		code:    "246810",
+	}
+	var out safeBuffer
+	var errOut safeBuffer
+	done := make(chan Result, 1)
+	go func() {
+		done <- Connect(context.Background(), Options{
+			Target: syntheticTarget(),
+			Source: source,
+			In:     localTTY,
+			Out:    &out,
+			Err:    &errOut,
+		})
+	}()
+	select {
+	case <-source.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("automatic provider did not start")
+	}
+	if _, err := localMaster.Write([]byte{0x02, 'd'}); err != nil {
+		t.Fatal(err)
+	}
+	close(source.release)
+	select {
+	case result := <-done:
+		if result.ExitCode != 0 || result.Err != nil {
+			t.Fatalf("result = %+v, stdout = %q, stderr = %q", result, out.String(), errOut.String())
+		}
+		if !strings.Contains(out.String(), "AUTH_OK") {
+			t.Fatalf("stdout = %q", out.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("automatic submission timed out")
+	}
+}
+
+func TestPendingInputKeepsInterruptControls(t *testing.T) {
+	value := []byte{0x02, 'd', 0x03, 0x1a, 0x1c}
+	var forwarded bytes.Buffer
+	if err := forwardPendingControls(&forwarded, value); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := forwarded.Bytes(), []byte{0x03, 0x1a, 0x1c}; !bytes.Equal(got, want) {
+		t.Fatalf("forwarded controls = %v, want %v", got, want)
+	}
+	if !bytes.Equal(value, make([]byte, len(value))) {
+		t.Fatalf("pending input was not cleared: %v", value)
+	}
+}
+
 func TestProviderFailureWithoutTTYFailsClosed(t *testing.T) {
 	bin := t.TempDir()
 	writeScript(t, filepath.Join(bin, "ssh"), `#!/bin/sh
@@ -255,6 +347,121 @@ exit 6
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("manual fallback timed out")
+	}
+}
+
+func TestVisibleManualFallbackDoesNotTreatLeadingControlDAsCode(t *testing.T) {
+	bin := t.TempDir()
+	writeScript(t, filepath.Join(bin, "ssh"), `#!/bin/sh
+printf 'Enter 6-digit verification code: '
+IFS= read code
+if [ "$code" = "135790" ]; then
+  printf '\nMANUAL_OK\n'
+  exit 0
+fi
+exit 6
+`)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	localMaster, localTTY, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localMaster.Close()
+	defer localTTY.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var out safeBuffer
+	var errOut safeBuffer
+	done := make(chan Result, 1)
+	go func() {
+		done <- Connect(ctx, Options{
+			Target: syntheticTarget(),
+			Source: &fakeSource{err: errors.New("synthetic provider failure")},
+			In:     localTTY,
+			Out:    &out,
+			Err:    &errOut,
+		})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(out.String(), "digits are visible") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !strings.Contains(out.String(), "digits are visible") {
+		t.Fatalf("manual prompt not shown: stdout = %q, stderr = %q", out.String(), errOut.String())
+	}
+	if _, err := localMaster.Write([]byte{0x04}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := localMaster.Write([]byte("135790\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-done:
+		if result.ExitCode != 0 || result.Err != nil {
+			t.Fatalf("result = %+v, stdout = %q, stderr = %q", result, out.String(), errOut.String())
+		}
+		if !strings.Contains(out.String(), "MANUAL_OK") {
+			t.Fatalf("stdout = %q", out.String())
+		}
+		if strings.Contains(out.String(), "code must contain only digits") {
+			t.Fatalf("control-D contaminated manual code: %q", out.String())
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatalf("manual fallback timed out: stdout = %q, stderr = %q", out.String(), errOut.String())
+	}
+}
+
+func TestVisibleManualFallbackProcessesBufferedRetry(t *testing.T) {
+	bin := t.TempDir()
+	writeScript(t, filepath.Join(bin, "ssh"), `#!/bin/sh
+printf 'Enter 6-digit verification code: '
+IFS= read code
+if [ "$code" = "135790" ]; then
+  printf '\nMANUAL_OK\n'
+  exit 0
+fi
+exit 6
+`)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	localMaster, localTTY, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localMaster.Close()
+	defer localTTY.Close()
+	var out safeBuffer
+	var errOut safeBuffer
+	done := make(chan Result, 1)
+	go func() {
+		done <- Connect(context.Background(), Options{
+			Target: syntheticTarget(),
+			Source: &fakeSource{err: errors.New("synthetic provider failure")},
+			In:     localTTY,
+			Out:    &out,
+			Err:    &errOut,
+		})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(out.String(), "digits are visible") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !strings.Contains(out.String(), "digits are visible") {
+		t.Fatalf("manual prompt not shown: stdout = %q, stderr = %q", out.String(), errOut.String())
+	}
+	if _, err := localMaster.Write([]byte("invalid\n135790\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-done:
+		if result.ExitCode != 0 || result.Err != nil {
+			t.Fatalf("result = %+v, stdout = %q, stderr = %q", result, out.String(), errOut.String())
+		}
+		if !strings.Contains(out.String(), "code must contain only digits") || !strings.Contains(out.String(), "MANUAL_OK") {
+			t.Fatalf("stdout = %q", out.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("buffered manual retry timed out: stdout = %q, stderr = %q", out.String(), errOut.String())
 	}
 }
 
