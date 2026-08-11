@@ -114,8 +114,97 @@ func TestBrokerGroupsReadyTargetsAndRefreshesLateTarget(t *testing.T) {
 }
 
 func TestDefaultClientTimeoutCoversProviderBudget(t *testing.T) {
-	if defaultClientTimeout <= provider.DefaultTimeout {
-		t.Fatalf("client timeout %v must exceed provider timeout %v", defaultClientTimeout, provider.DefaultTimeout)
+	if margin := defaultClientTimeout - provider.DefaultTimeout; margin != 2*time.Second {
+		t.Fatalf("client timeout margin = %v, want 2s", margin)
+	}
+	if margin := defaultConnectionTimeout - provider.DefaultTimeout; margin != 5*time.Second {
+		t.Fatalf("connection timeout margin = %v, want 5s", margin)
+	}
+}
+
+func TestActiveDetectsValidatedLiveBroker(t *testing.T) {
+	useShortRuntimeDir(t)
+	server, err := NewServer(sampleConfig(t), "production", &recordingSource{code: "246810"}, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	active, err := Active("production")
+	if err != nil || !active {
+		t.Fatalf("active = %v, err = %v", active, err)
+	}
+}
+
+func TestActiveReportsAbsentAndStaleBrokerAsInactive(t *testing.T) {
+	useShortRuntimeDir(t)
+	active, err := Active("production")
+	if err != nil || active {
+		t.Fatalf("absent active = %v, err = %v", active, err)
+	}
+	dir, err := runtimepath.SecureDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(dir, "broker-production.sock")
+	lease := filepath.Join(dir, "broker-production.lease")
+	if err := runtimepath.WriteLease(lease, runtimepath.Lease{
+		Kind:    "broker",
+		Profile: "production",
+		Socket:  socket,
+		Identity: runtimepath.Identity{
+			PID:        99999,
+			UID:        uint32(os.Getuid()),
+			Start:      "stale",
+			Executable: "jumpotp",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	active, err = Active("production")
+	if err != nil || active {
+		t.Fatalf("stale active = %v, err = %v", active, err)
+	}
+}
+
+func TestActiveRejectsConflictingBrokerState(t *testing.T) {
+	useShortRuntimeDir(t)
+	dir, err := runtimepath.SecureDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(dir, "broker-production.sock")
+	lease := filepath.Join(dir, "broker-production.lease")
+	identity, err := runtimepath.CurrentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtimepath.WriteLease(lease, runtimepath.Lease{
+		Kind:     "tmux",
+		Profile:  "other",
+		Socket:   socket,
+		Identity: identity,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := Active("production"); err == nil || active {
+		t.Fatalf("conflicting active = %v, err = %v", active, err)
+	}
+}
+
+func TestActiveRejectsSocketWithoutValidatedLease(t *testing.T) {
+	useShortRuntimeDir(t)
+	dir, err := runtimepath.SecureDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(dir, "broker-production.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if active, err := Active("production"); err == nil || active {
+		t.Fatalf("unleased active = %v, err = %v", active, err)
 	}
 }
 
@@ -262,6 +351,52 @@ func TestProviderFailureIsRedacted(t *testing.T) {
 	_, err = client.Code(context.Background(), "ignored")
 	if err == nil || err.Error() == "private provider detail" {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestBrokerPreservesMeasuredProviderTiming(t *testing.T) {
+	useShortRuntimeDir(t)
+	source := &recordingSource{err: provider.NewMeasuredError(provider.TimedOut, 7)}
+	server, err := NewServer(sampleConfig(t), "production", source, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go server.Serve(context.Background())
+	defer server.Close()
+	client := &Client{Socket: server.Socket(), Profile: "production", Target: "app-01", Timeout: time.Second}
+	_, err = client.Code(context.Background(), "ignored")
+	if got := provider.SafeMessage(err); got != "Bitwarden TOTP retrieval timed out after 7s" {
+		t.Fatalf("safe message = %q", got)
+	}
+}
+
+func TestBrokerResponseTimingIsOptionalBoundedAndMessageIndependent(t *testing.T) {
+	seven := 7
+	negative := -1
+	tooLarge := 21
+	tests := []struct {
+		name    string
+		seconds *int
+		want    string
+	}{
+		{name: "valid", seconds: &seven, want: "Bitwarden TOTP retrieval timed out after 7s"},
+		{name: "absent", want: "Bitwarden TOTP retrieval timed out"},
+		{name: "negative", seconds: &negative, want: "Bitwarden TOTP retrieval timed out"},
+		{name: "above deadline", seconds: &tooLarge, want: "Bitwarden TOTP retrieval timed out"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := responseError(response{
+				Version:        protocolVersion,
+				Status:         "error",
+				Kind:           string(provider.TimedOut),
+				Message:        "private item and provider output",
+				ElapsedSeconds: test.seconds,
+			})
+			if got := provider.SafeMessage(err); got != test.want {
+				t.Fatalf("safe message = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

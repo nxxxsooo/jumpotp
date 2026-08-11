@@ -119,6 +119,9 @@ exit 9
 	if strings.Contains(errOut.String(), "246810") {
 		t.Fatalf("diagnostics contain OTP: %q", errOut.String())
 	}
+	if strings.Contains(out.String(), " after ") || strings.Contains(errOut.String(), " after ") {
+		t.Fatalf("successful retrieval emitted timing: stdout = %q, stderr = %q", out.String(), errOut.String())
+	}
 }
 
 func TestPasswordPromptDoesNotCallProvider(t *testing.T) {
@@ -314,7 +317,7 @@ exit 6
 	}
 	defer localMaster.Close()
 	defer localTTY.Close()
-	source := &fakeSource{err: errors.New("synthetic provider failure")}
+	source := &fakeSource{err: provider.NewMeasuredError(provider.TimedOut, 6)}
 	var out safeBuffer
 	var errOut safeBuffer
 	done := make(chan Result, 1)
@@ -333,6 +336,9 @@ exit 6
 	}
 	if !strings.Contains(out.String(), "digits are visible") {
 		t.Fatalf("manual prompt not shown: stdout = %q, stderr = %q", out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "Bitwarden TOTP retrieval timed out after 6s") {
+		t.Fatalf("timed fallback reason missing: stdout = %q", out.String())
 	}
 	if _, err := localMaster.Write([]byte("135790\n")); err != nil {
 		t.Fatal(err)

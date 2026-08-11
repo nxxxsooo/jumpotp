@@ -472,6 +472,37 @@ func validSingleIdentifier(value string) bool {
 	return err == nil && !strings.Contains(value, string(filepath.Separator))
 }
 
+func runDirectWithReadiness(ctx context.Context, manual bool, source provider.ReadinessSource, errOut io.Writer, launch func() int) int {
+	if !manual {
+		warnReadinessFailure(source.Ready(ctx), errOut)
+	}
+	return launch()
+}
+
+func runWorkspaceWithReadiness(
+	ctx context.Context,
+	profile string,
+	manual bool,
+	source provider.ReadinessSource,
+	errOut io.Writer,
+	active func(string) (bool, error),
+	launch func() int,
+) int {
+	if !manual {
+		brokerActive, err := active(profile)
+		if err == nil && !brokerActive {
+			warnReadinessFailure(source.Ready(ctx), errOut)
+		}
+	}
+	return launch()
+}
+
+func warnReadinessFailure(err error, errOut io.Writer) {
+	if err != nil {
+		fmt.Fprintf(errOut, "jumpotp: %s; continuing with configured MFA fallback\n", provider.SafeReadinessMessage(err))
+	}
+}
+
 func defaultHandlers() Handlers {
 	return Handlers{
 		Connect: func(_ *config.Config, target config.EffectiveTarget, streams Streams) int {
@@ -480,56 +511,62 @@ func defaultHandlers() Handlers {
 				fmt.Fprintln(streams.Err, "jumpotp: connect requires an operating-system input stream")
 				return ExitMFA
 			}
-			result := terminalproxy.Connect(context.Background(), terminalproxy.Options{
-				Target: target,
-				Source: provider.Bitwarden{},
-				In:     input,
-				Out:    streams.Out,
-				Err:    streams.Err,
+			source := provider.Bitwarden{}
+			return runDirectWithReadiness(context.Background(), target.Manual, source, streams.Err, func() int {
+				result := terminalproxy.Connect(context.Background(), terminalproxy.Options{
+					Target: target,
+					Source: source,
+					In:     input,
+					Out:    streams.Out,
+					Err:    streams.Err,
+				})
+				if result.Err != nil && result.ExitCode != 0 {
+					fmt.Fprintf(streams.Err, "jumpotp: %v\n", result.Err)
+				}
+				return result.ExitCode
 			})
-			if result.Err != nil && result.ExitCode != 0 {
-				fmt.Fprintf(streams.Err, "jumpotp: %v\n", result.Err)
-			}
-			return result.ExitCode
 		},
 		Workspace: func(cfg *config.Config, profile string, launcher string, manual bool, streams Streams) int {
-			socket, err := broker.SocketPath(profile)
-			if err != nil {
-				fmt.Fprintf(streams.Err, "jumpotp: workspace broker path: %v\n", err)
-				return ExitWorkspace
-			}
-			var server *broker.Server
-			server, err = broker.NewServer(cfg, profile, provider.Bitwarden{}, 150*time.Millisecond)
-			ownsBroker := err == nil
-			if err != nil && !errors.Is(err, broker.ErrAlreadyRunning) {
-				fmt.Fprintf(streams.Err, "jumpotp: start workspace broker: %v\n", err)
-				return ExitWorkspace
-			}
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			if ownsBroker {
-				go func() {
-					if serveErr := server.Serve(ctx); serveErr != nil {
-						fmt.Fprintf(streams.Err, "jumpotp: workspace broker: %v\n", serveErr)
-					}
-				}()
-				defer server.Close()
-				socket = server.Socket()
-			}
-			manager := workspace.Manager{Config: cfg, Notice: streams.Err}
-			if err := manager.Ensure(ctx, profile, launcher, manual, socket); err != nil {
-				fmt.Fprintf(streams.Err, "jumpotp: prepare workspace: %v\n", err)
-				return ExitWorkspace
-			}
-			attachStreams := workspace.AttachStreams{In: streams.In, Out: streams.Out, Err: streams.Err}
-			if input, ok := streams.In.(*os.File); ok {
-				attachStreams.TTY = input.Name()
-			}
-			if err := manager.Attach(ctx, profile, attachStreams); err != nil {
-				fmt.Fprintf(streams.Err, "jumpotp: attach workspace: %v\n", err)
-				return ExitWorkspace
-			}
-			return ExitOK
+			source := provider.Bitwarden{}
+			return runWorkspaceWithReadiness(context.Background(), profile, manual, source, streams.Err, broker.Active, func() int {
+				socket, err := broker.SocketPath(profile)
+				if err != nil {
+					fmt.Fprintf(streams.Err, "jumpotp: workspace broker path: %v\n", err)
+					return ExitWorkspace
+				}
+				var server *broker.Server
+				server, err = broker.NewServer(cfg, profile, source, 150*time.Millisecond)
+				ownsBroker := err == nil
+				if err != nil && !errors.Is(err, broker.ErrAlreadyRunning) {
+					fmt.Fprintf(streams.Err, "jumpotp: start workspace broker: %v\n", err)
+					return ExitWorkspace
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if ownsBroker {
+					go func() {
+						if serveErr := server.Serve(ctx); serveErr != nil {
+							fmt.Fprintf(streams.Err, "jumpotp: workspace broker: %v\n", serveErr)
+						}
+					}()
+					defer server.Close()
+					socket = server.Socket()
+				}
+				manager := workspace.Manager{Config: cfg, Notice: streams.Err}
+				if err := manager.Ensure(ctx, profile, launcher, manual, socket); err != nil {
+					fmt.Fprintf(streams.Err, "jumpotp: prepare workspace: %v\n", err)
+					return ExitWorkspace
+				}
+				attachStreams := workspace.AttachStreams{In: streams.In, Out: streams.Out, Err: streams.Err}
+				if input, ok := streams.In.(*os.File); ok {
+					attachStreams.TTY = input.Name()
+				}
+				if err := manager.Attach(ctx, profile, attachStreams); err != nil {
+					fmt.Fprintf(streams.Err, "jumpotp: attach workspace: %v\n", err)
+					return ExitWorkspace
+				}
+				return ExitOK
+			})
 		},
 		Status: func(cfg *config.Config, profile string, jsonMode bool, streams Streams) int {
 			report, err := (workspace.Manager{Config: cfg}).Status(context.Background(), profile)

@@ -122,6 +122,41 @@ func SocketPath(profile string) (string, error) {
 	return path, nil
 }
 
+// Active reports whether profile has a live broker backed by a validated
+// runtime lease. It is deliberately read-only: stale or missing state is left
+// for NewServer to resolve through the authoritative broker lifecycle.
+func Active(profile string) (bool, error) {
+	socket, err := SocketPath(profile)
+	if err != nil {
+		return false, err
+	}
+	leasePath := filepath.Join(filepath.Dir(socket), "broker-"+profile+".lease")
+	lease, err := runtimepath.ReadLease(leasePath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return false, fmt.Errorf("validate broker lease: %w", err)
+		}
+		if _, socketErr := os.Lstat(socket); socketErr == nil {
+			return false, errors.New("broker socket exists without a validated lease")
+		} else if !errors.Is(socketErr, os.ErrNotExist) {
+			return false, fmt.Errorf("inspect broker socket: %w", socketErr)
+		}
+		return false, nil
+	}
+	if lease.Kind != "broker" || lease.Profile != profile || lease.Socket != socket {
+		return false, errors.New("broker lease identity is invalid")
+	}
+	if !runtimepath.Matches(lease.Identity) {
+		return false, nil
+	}
+	connection, err := net.DialTimeout("unix", socket, 100*time.Millisecond)
+	if err != nil {
+		return false, errors.New("live broker lease has no reachable socket")
+	}
+	_ = connection.Close()
+	return true, nil
+}
+
 func (s *Server) Socket() string {
 	return s.socket
 }
@@ -173,7 +208,7 @@ func (s *Server) Close() error {
 
 func (s *Server) handle(connection *net.UnixConn) {
 	defer connection.Close()
-	_ = connection.SetDeadline(time.Now().Add(defaultClientTimeout + 3*time.Second))
+	_ = connection.SetDeadline(time.Now().Add(defaultConnectionTimeout))
 	var req request
 	if err := readFrame(connection, &req); err != nil {
 		_ = writeFrame(connection, response{Version: protocolVersion, Status: "error", Kind: string(provider.Failed), Message: "invalid request"})
@@ -252,8 +287,12 @@ func (s *Server) flush(group string) {
 	}
 	if err != nil {
 		kind := provider.KindOf(err)
+		var elapsedSeconds *int
+		if seconds, measured := provider.ElapsedSeconds(err); measured {
+			elapsedSeconds = &seconds
+		}
 		for _, wait := range waiters {
-			wait.response <- response{Version: protocolVersion, Status: "error", Kind: string(kind), Message: provider.SafeMessage(err)}
+			wait.response <- response{Version: protocolVersion, Status: "error", Kind: string(kind), Message: provider.SafeMessage(err), ElapsedSeconds: elapsedSeconds}
 		}
 		mfa.Zero(code)
 		return

@@ -164,8 +164,22 @@ The default configuration path is
 ## Direct connection and visible fallback
 
 `connect` runs `ssh <alias>` or `sshm <alias>` in a real PTY. ANSI output,
-terminal resizing, signals, and child exit status pass through. JumpOTP calls
-Bitwarden only after the configured complete prompt matches.
+terminal resizing, signals, and child exit status pass through. Before an
+automatic connection, JumpOTP makes a best-effort readiness check by running
+exactly `bw status`. The check accepts only bounded valid JSON reporting an
+unlocked vault, uses the same fixed 20-second deadline as TOTP retrieval, and
+never includes an item reference or requests a code. A readiness failure emits
+one redacted warning and continues so the configured `prompt` or `fail`
+behavior remains authoritative. `--manual` skips both the check and retrieval.
+
+When readiness or prompt-time retrieval fails, JumpOTP appends only a bounded,
+low-resolution elapsed time to the redacted stage-specific reason. Durations
+below one second appear as `<1s`; longer failures use the nearest whole second,
+capped at the 20-second provider deadline. Successful operations remain silent,
+and timing never includes item references, command output, session data, or
+details from inside a `bw` wrapper.
+
+JumpOTP requests a TOTP only after the configured complete prompt matches.
 
 If retrieval fails and fallback is `prompt`, JumpOTP explains the failure,
 temporarily restores normal terminal echo, and lets you type visible digits.
@@ -187,7 +201,15 @@ lists, modifies, or kills the default tmux server.
 An ephemeral current-user Unix-socket broker groups targets that use the same
 Bitwarden item. The broker exists only while a workspace command is active.
 Target panes remain usable if it disappears and can accept visible manual
-input or reconnect to a later broker.
+input or reconnect to a later broker. Starting a new automatic workspace runs
+the same best-effort readiness check before creating targets. Reattaching to a
+workspace with a validated active broker skips it; ambiguous broker state is
+left to the existing fail-closed lifecycle checks.
+
+Workspace provider failures carry the same elapsed-time bucket as an optional
+bounded number in the existing broker protocol. Broker messages are not used
+as diagnostics, and old version-one peers remain compatible when the field is
+absent or ignored.
 
 Health probes are disabled by default. When enabled they first require
 `ssh -O check`, use `BatchMode=yes`, rotate in a separate health window,
