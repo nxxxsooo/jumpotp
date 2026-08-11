@@ -29,8 +29,8 @@ Execution notes: tasks 1.x and 8.x require live infrastructure or repository aut
 
 ## 6. Status derivation
 
-- [ ] 6.1 Add failing status tests: wrapper window alive + ControlMaster unavailable reports `connecting`; alive + available reports `running`; absent reports `stopped`; failed rules unchanged; JSON schema field values updated accordingly.
-- [ ] 6.2 Implement the derivation in `internal/workspace/status.go`; rerun focused tests to green.
+- [x] 6.1 Add failing status tests: wrapper window alive + ControlMaster unavailable reports `connecting`; alive + available reports `running`; absent reports `stopped`; failed rules unchanged; JSON schema field values updated accordingly.
+- [x] 6.2 Implement the derivation in `internal/workspace/status.go`; rerun focused tests to green.
 
 ## 7. Integration, documentation, and full verification
 
