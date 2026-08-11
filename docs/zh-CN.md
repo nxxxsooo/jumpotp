@@ -2,7 +2,8 @@
 
 JumpOTP 用于你有权访问的交互式 SSH／JumpServer 会话。它在严格匹配到 TOTP
 提示后，从当前已经登录或解锁的 Bitwarden Password Manager CLI 获取一次性
-验证码，并且每条连接最多自动提交一次。
+验证码并自动提交——每次连接尝试最多自动提交两次，且从不重复同一验证码，
+之后转入手动兜底。
 
 ## 安装
 
@@ -58,9 +59,55 @@ jumpotp stop production
 关闭终端或 detach 后会话仍在，再次运行同一命令即可 reattach。`stop`
 只停止指定 profile，不关闭 OpenSSH ControlMaster。
 
+> **破坏性变更：** workspace 的每个 target 窗口不再提供交互式远程 shell，
+> 只负责完成 MFA 并持有 OpenSSH ControlMaster 连接，不是用来输入远程命令
+> 的地方。target 就绪后，请在普通终端里用 `ssh <alias>`（或
+> `sshm <alias>`）执行交互操作——它会复用 target 窗口持有的同一个
+> ControlMaster，因此不会触发新的 MFA。从旧版本迁移不需要改动配置，只需
+> 停止在 target 窗口里直接输入命令，改用 `ssh <alias>`。
+
+每个 target 窗口都是一个 sessionless master：target wrapper 以
+`<launcher> -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3
+-o ControlPersist=no <alias>` 发起连接。`-N` 不申请远程 shell、命令或
+session channel，因此连接只完成 MFA 并持有 ControlMaster，堡垒机的交互
+空闲回收机制找不到可以回收的会话。`ControlPersist=no` 只作用于 wrapper
+自己发起的这次调用——即便用户自己的 `~/.ssh/config` 对裸 `ssh` 调用启用了
+ControlPersist，master 的生命周期依然与窗口绑定。`ControlMaster`／
+`ControlPath` 的选择仍然完全由用户的 `~/.ssh/config` 决定，和之前一样。
+如果 ControlPath 上已经有一个外部 ControlMaster，sessionless 客户端会直接
+经由它连接、无需 MFA；只有在那个外部 master 退出后，之后的连接尝试才会
+成为新的 master。
+
+每个 target 窗口的 wrapper 会监督它启动的 launcher 子进程。当子进程因
+非人工停止的原因退出——即不是 `stop`、关闭窗口或中断——wrapper 会按指数
+退避重连：从 5 秒开始倍增，上限 300 秒，并带有限抖动，每次重试都会重置
+该次连接尝试的自动提交状态。发起连接前，wrapper 要求先确认存在可复用的
+ControlMaster（`ssh -O check`）或经过验证、可达的 profile broker；两者都
+不满足时，wrapper 每 10 秒重新检查一次，期间完全不会发起 SSH 连接，因此
+无人值守的 workspace 不会产生失败的 MFA 尝试或多余的堡垒机连接噪音。窗口
+在整个过程中都会保留；下一次 `workspace` 调用带来的 broker 通常足以让
+完全断开的 target 自行恢复，不需要手工修复窗口。
+
+`jumpotp status` 会把每个 target 报告为 `running`（窗口存活且
+ControlMaster 已确认）、`connecting`（窗口存活、正在按上面的机制重连或
+等待条件，ControlMaster 尚未确认）、`stopped`（窗口不存在）或 `failed`
+（pane 状态异常），并附带 session、broker 与健康检查状态；这一切都不会
+读取 pane 内容。
+
+使用同一个 Bitwarden 条目的 target 会在一次性、仅当前用户可访问的 broker
+中分组：broker 只在一次 workspace 调用存续期间存在，为同组内几乎同时就绪
+的 target 只调用一次 Bitwarden，并把结果分发给每个已就绪的 wrapper。broker
+触发一次分组取码前，会先检查当前 30 秒 TOTP 窗口：如果剩余不足 8 秒，就
+等到下一个窗口边界再向 Bitwarden 取码，确保每个下发的验证码都留有足够的
+提交与重试时间。
+
 Bitwarden 取码失败时，默认会在对应终端说明原因、恢复正常回显，并让你直接
 输入可见数字。使用 `fallback: fail` 可改为失败退出；使用 `--manual`
-可在本次调用中完全跳过 Bitwarden。
+可在本次调用中完全跳过 Bitwarden。若自动提交的验证码被拒绝且再次出现同一
+提示，JumpOTP 会等到下一个 TOTP 窗口边界、取一个新验证码后再自动提交一次
+——同一验证码不会被重复提交。第二次被拒绝后，或者取不到新验证码时，
+JumpOTP 不再自动提交，转入上述的手动或失败兜底；每一次 supervised 重连
+都是一次新的连接尝试，各自拥有独立的两次自动提交额度。
 
 自动直连开始前，JumpOTP 会运行一次严格限定的 `bw status`，作为尽力而为的
 就绪检查。它只接受表示保险库已解锁的有效、有界 JSON，不传入条目引用，也不
@@ -89,8 +136,10 @@ workspace provider 失败通过现有 broker 协议中的可选有界数值传�
 
 自动读取密码管理器中的 TOTP 会降低第二因素隔离度。JumpOTP 假设同一操作
 系统用户下的进程可信，并继续依赖 OpenSSH 主机密钥验证。它使用严格 prompt
-匹配、每连接只自动提交一次、临时 Unix socket、独立 tmux server，并且不把
-OTP 放入 argv、环境变量、日志、文件、剪贴板或 tmux buffer。
+匹配、每次连接尝试最多自动提交两次且从不重复同一验证码、临时 Unix socket、
+独立 tmux server，并且不把 OTP 放入 argv、环境变量、日志、文件、剪贴板或
+tmux buffer；重连前必须先确认存在可复用的 master 或经验证的 broker，因此
+无人值守的 workspace 不会产生失败的 MFA 尝试。
 
 远端服务仍可能自行回显已提交数字，这不在 JumpOTP 的控制范围内。JumpOTP
 没有遥测，也不会自动检查更新。

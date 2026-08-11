@@ -290,7 +290,7 @@ printf 'Enter 6-digit verification code: '
 IFS= read first
 printf '\nEnter 6-digit verification code: '
 IFS= read second
-if [ "$second" = "135790" ]; then
+if [ "$second" = "123456" ]; then
   printf '\nMANUAL_OK\n'
   exit 0
 fi
@@ -330,7 +330,7 @@ exit 6
 	if calls := source.callCount(); calls != 2 {
 		t.Fatalf("provider calls = %d, want 2 (no further auto retry)", calls)
 	}
-	if _, err := localMaster.Write([]byte("135790\n")); err != nil {
+	if _, err := localMaster.Write([]byte("123456\n")); err != nil {
 		t.Fatal(err)
 	}
 	select {

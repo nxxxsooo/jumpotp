@@ -34,9 +34,9 @@ Execution notes: tasks 1.x and 8.x require live infrastructure or repository aut
 
 ## 7. Integration, documentation, and full verification
 
-- [ ] 7.1 Extend workspace integration tests: a supervised wrapper whose child exits keeps its window and reconnects when the gate opens; `reconcileSession` remains fail-closed and never fights a live supervised pane; create/attach/stop flows unchanged.
-- [ ] 7.2 Update README, docs/zh-CN.md, and CHANGELOG (0.2.0 Unreleased) with the sessionless-window breaking change, reconnection behavior, boundary guard, and migration note ("workspace windows hold connections; use `ssh <alias>` for interactive work").
-- [ ] 7.3 Run strict OpenSpec validation, `make check`, `go test -race ./...`, `./scripts/build.sh`, and `node scripts/scrub.mjs`; resolve in-scope regressions without versioning, publishing, or live MFA.
+- [x] 7.1 Extend workspace integration tests: a supervised wrapper whose child exits keeps its window and reconnects when the gate opens; `reconcileSession` remains fail-closed and never fights a live supervised pane; create/attach/stop flows unchanged.
+- [x] 7.2 Update README, docs/zh-CN.md, and CHANGELOG (0.2.0 Unreleased) with the sessionless-window breaking change, reconnection behavior, boundary guard, and migration note ("workspace windows hold connections; use `ssh <alias>` for interactive work").
+- [x] 7.3 Run strict OpenSpec validation, `make check`, `go test -race ./...`, `./scripts/build.sh`, and `node scripts/scrub.mjs`; resolve in-scope regressions without versioning, publishing, or live MFA.
 
 ## 8. Live validation and release preparation (supervising agent)
 
