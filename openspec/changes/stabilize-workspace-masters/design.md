@@ -11,8 +11,9 @@
 
 ### D1: Sessionless master windows
 
-The workspace target wrapper launches `<launcher> -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3 <alias>` instead of `<launcher> <alias>`. `ControlMaster auto`/`ControlPath` remain the user's ssh_config responsibility exactly as today. Effects:
+The workspace target wrapper launches `<launcher> -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ControlPersist=no <alias>` instead of `<launcher> <alias>`. `ControlMaster auto`/`ControlPath` remain the user's ssh_config responsibility exactly as today. Effects:
 
+- `ControlPersist=no` applies only to the wrapper-owned invocation: without it, a user-level `ControlPersist` setting daemonizes the master and the wrapper child exits immediately (observed live in E1), detaching the master from the window. User bare-`ssh` ControlPersist behavior is unaffected.
 - No remote shell, no PTY session on the asset, nothing for the interactive-idle reaper to kill.
 - The keepalives bound dead-TCP detection to ~3 minutes so the supervisor notices real network loss.
 - If an external ControlMaster already owns the path (e.g. a leftover `ControlPersist` master), the `-N` client attaches as a session-free mux client; when that master exits, the client exits and the supervisor's next attempt becomes the new master. No special-case code.
