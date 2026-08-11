@@ -24,8 +24,8 @@ Execution notes: tasks 1.x and 8.x require live infrastructure or repository aut
 
 ## 5. Bounded automatic resubmission
 
-- [ ] 5.1 Add failing terminal-proxy tests: first rejection triggers exactly one automatic retry that waits past the TOTP window boundary of the submitted code; the same code value is never written twice; a second rejection enters the existing manual/fail fallback; manual-mode and `--manual` behavior are unchanged; zeroization still covers every code buffer.
-- [ ] 5.2 Implement the bounded resubmission state machine in `internal/terminal/connect.go` (per-attempt counter, boundary wait, fresh broker request); rerun focused tests to green.
+- [x] 5.1 Add failing terminal-proxy tests: first rejection triggers exactly one automatic retry that waits past the TOTP window boundary of the submitted code; the same code value is never written twice; a second rejection enters the existing manual/fail fallback; manual-mode and `--manual` behavior are unchanged; zeroization still covers every code buffer.
+- [x] 5.2 Implement the bounded resubmission state machine in `internal/terminal/connect.go` (per-attempt counter, boundary wait, fresh broker request); rerun focused tests to green.
 
 ## 6. Status derivation
 

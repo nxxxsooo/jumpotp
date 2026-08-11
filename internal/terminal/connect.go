@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"golang.org/x/sys/unix"
@@ -55,6 +56,57 @@ const (
 type terminalInput struct {
 	value []byte
 	mode  terminalInputMode
+}
+
+// totpWindowPeriod is the epoch-aligned TOTP window used by the
+// jumpserver-koko preset (6-digit/30s), matching the broker's rotation
+// guard. boundarySkew absorbs clock/RTT slop so a retry fetched right at the
+// boundary has not itself gone stale by the time it reaches the endpoint.
+const (
+	totpWindowPeriod = 30 * time.Second
+	boundarySkew     = 300 * time.Millisecond
+)
+
+// nowFunc and waitUntilBoundary are the clock seam for the bounded
+// resubmission retry below; tests override both to avoid real 30s waits.
+var nowFunc = time.Now
+
+var waitUntilBoundary = func(ctx context.Context, target time.Time) error {
+	delay := target.Sub(nowFunc())
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// nextTOTPBoundary returns the next epoch-aligned totpWindowPeriod boundary
+// strictly after t, even when t already sits exactly on one.
+func nextTOTPBoundary(t time.Time) time.Time {
+	period := int64(totpWindowPeriod / time.Second)
+	seconds := t.Unix()
+	boundarySeconds := seconds - seconds%period + period
+	return time.Unix(boundarySeconds, 0)
+}
+
+// evaluateRetryCode compares a freshly retried code against the previously
+// submitted one. previous is always zeroed since this comparison is its
+// last use; fresh is zeroed too only on a match, since a match means it
+// will never be submitted (on a non-match the caller submits fresh and
+// zeroes it itself once written).
+func evaluateRetryCode(previous, fresh []byte) bool {
+	match := len(previous) > 0 && bytes.Equal(previous, fresh)
+	mfa.Zero(previous)
+	if match {
+		mfa.Zero(fresh)
+	}
+	return match
 }
 
 func Connect(ctx context.Context, options Options) Result {
@@ -136,8 +188,13 @@ func Connect(ctx context.Context, options Options) Result {
 	signal.Notify(signals, syscall.SIGWINCH, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(signals)
 
-	autoUsed := false
+	autoSubmissions := 0
+	manualSubmitted := false
 	providerPending := false
+	retryFetchPending := false
+	var previousCode []byte
+	var previousCodeAt time.Time
+	defer func() { mfa.Zero(previousCode) }()
 	var providerGeneration uint64
 	var providerCancel context.CancelFunc
 	defer func() {
@@ -222,10 +279,13 @@ func Connect(ctx context.Context, options Options) Result {
 				continue
 			}
 			matcher.Reset()
-			if options.Target.Manual || autoUsed {
+			if options.Target.Manual || manualSubmitted || autoSubmissions >= 2 {
 				reason := "manual mode requested"
-				if autoUsed {
-					reason = "automatic submission was already used for this connection"
+				switch {
+				case manualSubmitted:
+					reason = "manual code was already submitted for this connection"
+				case autoSubmissions >= 2:
+					reason = "automatic submission is exhausted for this connection"
 				}
 				if err := enterManual(reason); err != nil {
 					finish()
@@ -244,6 +304,23 @@ func Connect(ctx context.Context, options Options) Result {
 			providerGeneration++
 			generation := providerGeneration
 			providerPending = true
+			if autoSubmissions == 1 {
+				// Second strict-matched prompt after one automatic
+				// submission: the endpoint rejected that code. Wait for the
+				// next TOTP window boundary before fetching so the retry is
+				// never drawn from the same window as the rejected code.
+				retryFetchPending = true
+				boundary := nextTOTPBoundary(previousCodeAt).Add(boundarySkew)
+				go func(item string, generation uint64, boundary time.Time) {
+					if err := waitUntilBoundary(ctx, boundary); err != nil {
+						providerCh <- providerResult{generation: generation, err: err}
+						return
+					}
+					code, codeErr := options.Source.Code(ctx, item)
+					providerCh <- providerResult{generation: generation, code: code, err: codeErr}
+				}(options.Target.Item, generation, boundary)
+				continue
+			}
 			go func(item string, generation uint64) {
 				code, codeErr := options.Source.Code(ctx, item)
 				providerCh <- providerResult{generation: generation, code: code, err: codeErr}
@@ -254,7 +331,21 @@ func Connect(ctx context.Context, options Options) Result {
 				continue
 			}
 			providerPending = false
+			isRetry := retryFetchPending
+			retryFetchPending = false
 			if result.err != nil {
+				if isRetry {
+					mfa.Zero(previousCode)
+					previousCode = nil
+					if manualMode {
+						continue
+					}
+					if err := enterManual(provider.SafeMessage(result.err)); err != nil {
+						finish()
+						return Result{ExitCode: 4, Err: err}
+					}
+					continue
+				}
 				if awaiting, ok := options.Source.(provider.AwaitingSource); ok && !manualMode {
 					kind := provider.KindOf(result.err)
 					if kind == provider.Unavailable || kind == provider.TimedOut {
@@ -288,9 +379,21 @@ func Connect(ctx context.Context, options Options) Result {
 			}
 			if err := mfa.ValidateCode(result.code, options.Target.MFA); err != nil {
 				mfa.Zero(result.code)
+				if isRetry {
+					mfa.Zero(previousCode)
+					previousCode = nil
+				}
 				if fallbackErr := enterManual("Bitwarden returned an invalid TOTP value"); fallbackErr != nil {
 					finish()
 					return Result{ExitCode: 4, Err: fallbackErr}
+				}
+				continue
+			}
+			if isRetry && evaluateRetryCode(previousCode, result.code) {
+				previousCode = nil
+				if err := enterManual("a fresh TOTP code was not yet available; automatic submission is exhausted for this connection"); err != nil {
+					finish()
+					return Result{ExitCode: 4, Err: err}
 				}
 				continue
 			}
@@ -308,15 +411,31 @@ func Connect(ctx context.Context, options Options) Result {
 					rawActive = true
 				}
 			}
+			// Retain a copy before the code is zeroed below: if the endpoint
+			// rejects this submission, the next matched prompt needs it to
+			// recognize (and refuse to resubmit) a stale retry code.
+			var retained []byte
+			if isRetry {
+				previousCode = nil
+			} else {
+				retained = append([]byte(nil), result.code...)
+			}
 			payload := append(result.code, '\n')
 			_, writeErr := ptmx.Write(payload)
 			mfa.Zero(payload)
 			mfa.Zero(result.code)
 			if writeErr != nil {
+				mfa.Zero(retained)
 				finish()
 				return Result{ExitCode: 4, Err: fmt.Errorf("submit automatic code: %w", writeErr)}
 			}
-			autoUsed = true
+			if isRetry {
+				autoSubmissions = 2
+			} else {
+				autoSubmissions = 1
+				previousCode = retained
+				previousCodeAt = nowFunc()
+			}
 			matcher.Reset()
 			currentInputMode.Store(int32(inputProxy))
 		case input := <-inputCh:
@@ -405,7 +524,7 @@ func Connect(ctx context.Context, options Options) Result {
 					return Result{ExitCode: 4, Err: fmt.Errorf("submit manual code: %w", writeErr)}
 				}
 				manualMode = false
-				autoUsed = true
+				manualSubmitted = true
 				matcher.Reset()
 				if isTTY {
 					if _, err := term.MakeRaw(fd); err != nil {
