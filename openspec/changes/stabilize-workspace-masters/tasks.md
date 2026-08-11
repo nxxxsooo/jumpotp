@@ -40,6 +40,6 @@ Execution notes: tasks 1.x and 8.x require live infrastructure or repository aut
 
 ## 8. Live validation and release preparation (supervising agent)
 
-- [ ] 8.1 Evaluate E1 after 40+ unattended minutes: require `ssh -O check` success and a mux exec success on the throwaway ControlPath, then tear the experiment master down. On failure, apply the documented pivot (drop `-N` from the launcher decision, keep supervision/guard/status) before proceeding.
+- [x] 8.1 Evaluate E1 after 40+ unattended minutes: require `ssh -O check` success and a mux exec success on the throwaway ControlPath, then tear the experiment master down. On failure, apply the documented pivot (drop `-N` from the launcher decision, keep supervision/guard/status) before proceeding.
 - [ ] 8.2 Rebuild and install the local binary, restart the production workspace, and verify the Product Brief success scenarios: three targets `Master running` after 2+ unattended hours; a killed master self-heals with an active broker and waits gated without one; five consecutive cold starts authenticate all targets with zero manual TOTP entry; `status` shows `connecting` during reconnection.
 - [ ] 8.3 Open the pull request from `feat/stabilize-workspace-masters` with the archived-prerequisite history and verification evidence. Version tagging and publishing remain a separately authorized release step.
