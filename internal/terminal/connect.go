@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 
 	"github.com/nxxxsooo/jumpotp/internal/config"
@@ -78,6 +79,12 @@ func Connect(ctx context.Context, options Options) Result {
 	defer ptmx.Close()
 
 	fd := int(options.In.Fd())
+	// options.In.Fd() (above) permanently disables options.In.SetReadDeadline
+	// per os.File.Fd's documented behavior, so readInputChunks below cannot
+	// use a deadline to unblock a pending read when a supervisor retires this
+	// attempt. Put the fd in non-blocking mode instead so its own poll+read
+	// loop can be cancelled without relying on that mechanism.
+	_ = unix.SetNonblock(fd, true)
 	isTTY := term.IsTerminal(fd)
 	var originalState *term.State
 	rawActive := false
@@ -107,7 +114,22 @@ func Connect(ctx context.Context, options Options) Result {
 		readChunks(ptmx, outputCh, outputErrCh)
 		close(outputCh)
 	}()
-	go readInputChunks(options.In, inputCh, inputErrCh, isTTY, &currentInputMode)
+	inputCancel := make(chan struct{})
+	inputDone := make(chan struct{})
+	go func() {
+		defer close(inputDone)
+		readInputChunks(fd, inputCh, inputErrCh, isTTY, &currentInputMode, inputCancel)
+	}()
+	// A supervisor may call Connect again with the same *os.File once this
+	// attempt ends. Without retiring this goroutine first, it stays parked
+	// in readInputChunks and races the next attempt's reader for the same
+	// TTY bytes. Closing inputCancel makes the poll-gated loop below exit at
+	// its next wakeup, and waiting on inputDone guarantees it has fully
+	// stopped reading before this attempt returns.
+	defer func() {
+		close(inputCancel)
+		<-inputDone
+	}()
 	go func() { waitCh <- command.Wait() }()
 
 	signals := make(chan os.Signal, 4)
@@ -447,28 +469,88 @@ func readChunks(reader io.Reader, values chan<- []byte, errorsOut chan<- error) 
 	}
 }
 
-func readInputChunks(reader io.Reader, values chan<- terminalInput, errorsOut chan<- error, retryEOF bool, mode *atomic.Int32) {
+// inputPollTimeoutMillis bounds how long readInputChunks can sit inside a
+// single unix.Poll call, which in turn bounds how quickly it notices cancel
+// being closed. It is short enough to retire an idle attempt promptly and
+// long enough to keep the poll loop cheap.
+const inputPollTimeoutMillis = 200
+
+// readInputChunks reads operator input from fd until it hits a terminal
+// error, EOF (once, or twice in a row when retryEOF is set), or cancel is
+// closed. It reads via a poll-then-read loop on the raw fd rather than
+// file.Read because, by the time this is called, Connect has already called
+// options.In.Fd() (for term.IsTerminal/term.MakeRaw), which per os.File.Fd's
+// documented behavior permanently disables that File's SetReadDeadline --
+// so a blocked file.Read could not be unblocked from outside. Gating each
+// read behind a bounded poll lets the loop re-check cancel on its own
+// instead, which is what makes it safe for a supervisor to reuse the same
+// *os.File across consecutive Connect attempts: this loop is guaranteed to
+// have stopped touching fd before Connect returns (see the deferred
+// close(inputCancel); <-inputDone in Connect).
+func readInputChunks(fd int, values chan<- terminalInput, errorsOut chan<- error, retryEOF bool, mode *atomic.Int32, cancel <-chan struct{}) {
 	buffer := make([]byte, 4096)
 	previousReadWasEOF := false
 	for {
-		count, err := reader.Read(buffer)
+		select {
+		case <-cancel:
+			return
+		default:
+		}
+		pollFDs := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		ready, err := unix.Poll(pollFDs, inputPollTimeoutMillis)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			select {
+			case errorsOut <- err:
+			case <-cancel:
+			}
+			return
+		}
+		if ready == 0 {
+			continue
+		}
+		count, err := unix.Read(fd, buffer)
 		if count > 0 {
 			value := append([]byte(nil), buffer[:count]...)
-			values <- terminalInput{value: value, mode: terminalInputMode(mode.Load())}
+			// An unguarded send can block forever once Connect stops draining
+			// values, and Connect's deferred <-inputDone would then deadlock;
+			// the cancel arm also zeroes bytes that may hold a manual code.
+			select {
+			case values <- terminalInput{value: value, mode: terminalInputMode(mode.Load())}:
+			case <-cancel:
+				mfa.Zero(value)
+				return
+			}
 			previousReadWasEOF = false
 		}
-		if err == nil {
+		if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == unix.EINTR {
+			continue
+		}
+		if err == nil && count == 0 {
+			// A zero-byte, error-free read (e.g. from /dev/null) signals EOF
+			// under POSIX read() semantics, matching what os.File.Read would
+			// have surfaced as io.EOF.
+			err = io.EOF
+		} else if err == nil {
 			continue
 		}
 		if retryEOF && errors.Is(err, io.EOF) {
 			if previousReadWasEOF {
-				errorsOut <- err
+				select {
+				case errorsOut <- err:
+				case <-cancel:
+				}
 				return
 			}
 			previousReadWasEOF = true
 			continue
 		}
-		errorsOut <- err
+		select {
+		case errorsOut <- err:
+		case <-cancel:
+		}
 		return
 	}
 }

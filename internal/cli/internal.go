@@ -5,13 +5,20 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/nxxxsooo/jumpotp/internal/broker"
 	"github.com/nxxxsooo/jumpotp/internal/config"
 	"github.com/nxxxsooo/jumpotp/internal/probes"
+	"github.com/nxxxsooo/jumpotp/internal/supervise"
 	terminalproxy "github.com/nxxxsooo/jumpotp/internal/terminal"
 )
+
+// masterCheckTimeout bounds the "ssh -O check <alias>" gate probe, mirroring
+// internal/workspace/status.go's controlMasterState.
+const masterCheckTimeout = 3 * time.Second
 
 func runInternal(args []string, streams Streams) int {
 	if os.Getenv("JUMPOTP_INTERNAL") != "1" || len(args) == 0 {
@@ -47,14 +54,33 @@ func runInternal(args []string, streams Streams) int {
 			fmt.Fprintln(streams.Err, "jumpotp: target wrapper requires an operating-system input stream")
 			return ExitMFA
 		}
-		source := &broker.Client{Socket: flags["--broker"], Profile: target.Profile, Target: target.Target}
-		result := terminalproxy.Connect(context.Background(), terminalproxy.Options{
-			Target: target,
-			Source: source,
-			In:     input,
-			Out:    streams.Out,
-			Err:    streams.Err,
-		})
+		brokerSocket := flags["--broker"]
+		sup := supervise.Supervisor{
+			Profile: target.Profile,
+			Target:  target.Target,
+			Connect: func(ctx context.Context) supervise.ConnectResult {
+				source := &broker.Client{Socket: brokerSocket, Profile: target.Profile, Target: target.Target}
+				result := terminalproxy.Connect(ctx, terminalproxy.Options{
+					Target: target,
+					Source: source,
+					In:     input,
+					Out:    streams.Out,
+					Err:    streams.Err,
+				})
+				return supervise.ConnectResult{ExitCode: result.ExitCode, Err: result.Err}
+			},
+			MasterCheck: func() (bool, error) {
+				checkCtx, cancel := context.WithTimeout(context.Background(), masterCheckTimeout)
+				defer cancel()
+				_, err := exec.CommandContext(checkCtx, "ssh", "-O", "check", target.SSH).Output()
+				return err == nil, nil
+			},
+			BrokerActive: func() (bool, error) {
+				return broker.Active(target.Profile)
+			},
+			Out: streams.Err,
+		}
+		result := sup.Run(context.Background())
 		if result.Err != nil && result.ExitCode != 0 {
 			fmt.Fprintf(streams.Err, "jumpotp: %v\n", result.Err)
 		}

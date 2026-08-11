@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -518,6 +519,64 @@ exit 6
 	case <-time.After(5 * time.Second):
 		t.Fatal("broker reconnect timed out")
 	}
+}
+
+// TestStaleInputReaderRetiredBeforeNextAttempt guards against a supervisor
+// reusing the same *os.File across consecutive Connect calls: if the reader
+// goroutine started by the first attempt were still blocked in Read when the
+// second attempt starts its own reader, both would compete for bytes on the
+// shared TTY. It asserts, after each Connect call returns, that no
+// readInputChunks goroutine from a prior attempt remains on the stack.
+func TestStaleInputReaderRetiredBeforeNextAttempt(t *testing.T) {
+	bin := t.TempDir()
+	writeScript(t, filepath.Join(bin, "ssh"), "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	localMaster, localTTY, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localMaster.Close()
+	defer localTTY.Close()
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		var out, errOut safeBuffer
+		result := Connect(context.Background(), Options{
+			Target: syntheticTarget(),
+			Source: &fakeSource{code: "246810"},
+			In:     localTTY,
+			Out:    &out,
+			Err:    &errOut,
+		})
+		if result.ExitCode != 0 {
+			t.Fatalf("attempt %d: result = %+v, stderr = %q", attempt, result, errOut.String())
+		}
+		assertNoStaleInputReader(t, attempt)
+	}
+}
+
+// assertNoStaleInputReader polls briefly rather than checking once to absorb
+// any scheduler latency between the retiring goroutine's exit and the
+// runtime's bookkeeping catching up; the retirement itself is synchronous
+// (Connect blocks on it before returning), so this is a safety margin on the
+// observation, not on the property being verified.
+func assertNoStaleInputReader(t *testing.T, attempt int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if count := countReadInputChunksGoroutines(); count == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("attempt %d: a readInputChunks goroutine from a prior attempt is still running", attempt)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func countReadInputChunksGoroutines() int {
+	buffer := make([]byte, 1<<20)
+	length := runtime.Stack(buffer, true)
+	return strings.Count(string(buffer[:length]), "readInputChunks(")
 }
 
 func syntheticTarget() config.EffectiveTarget {

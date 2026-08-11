@@ -14,8 +14,8 @@ Execution notes: tasks 1.x and 8.x require live infrastructure or repository aut
 
 ## 3. Supervised reconnection in the target wrapper
 
-- [ ] 3.1 Add failing supervisor tests (injectable clock and runner): child exit schedules backoff 5s→doubling→300s cap with bounded jitter; gate requires `ssh -O check` success or `broker.Active` truth before any dial; gate failure polls on a bounded interval with zero launcher invocations; SIGTERM/SIGHUP/interrupt exit without respawn; submission state resets per attempt; redacted status lines are emitted for connect, exit, backoff, and waiting states.
-- [ ] 3.2 Implement the supervision loop around the existing single-shot connect flow in the `__target` path (`internal/cli/internal.go` plus a new supervisor unit beside `internal/terminal` or `internal/workspace`), reusing `broker.Active` as the broker gate; rerun focused tests to green.
+- [x] 3.1 Add failing supervisor tests (injectable clock and runner): child exit schedules backoff 5s→doubling→300s cap with bounded jitter; gate requires `ssh -O check` success or `broker.Active` truth before any dial; gate failure polls on a bounded interval with zero launcher invocations; SIGTERM/SIGHUP/interrupt exit without respawn; submission state resets per attempt; redacted status lines are emitted for connect, exit, backoff, and waiting states.
+- [x] 3.2 Implement the supervision loop around the existing single-shot connect flow in the `__target` path (`internal/cli/internal.go` plus a new supervisor unit beside `internal/terminal` or `internal/workspace`), reusing `broker.Active` as the broker gate; rerun focused tests to green.
 
 ## 4. Broker rotation-boundary guard
 
