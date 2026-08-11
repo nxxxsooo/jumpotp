@@ -9,8 +9,8 @@ Execution notes: tasks 1.x and 8.x require live infrastructure or repository aut
 
 ## 2. Sessionless launcher arguments
 
-- [ ] 2.1 Add failing launcher tests: workspace master mode builds `<launcher> -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ControlPersist=no <alias>` for both `ssh` and `sshm`, direct `connect` argument construction is unchanged, and the mode is explicit in the launcher API rather than inferred.
-- [ ] 2.2 Implement the master-mode argument builder in `internal/launcher` and thread the workspace call path (`internal/workspace/manager.go` target command → `__target` → launcher) to request it; rerun focused tests to green.
+- [x] 2.1 Add failing launcher tests: workspace master mode builds `<launcher> -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ControlPersist=no <alias>` for both `ssh` and `sshm`, direct `connect` argument construction is unchanged, and the mode is explicit in the launcher API rather than inferred.
+- [x] 2.2 Implement the master-mode argument builder in `internal/launcher` and thread the workspace call path (`internal/workspace/manager.go` target command → `__target` → launcher) to request it; rerun focused tests to green.
 
 ## 3. Supervised reconnection in the target wrapper
 

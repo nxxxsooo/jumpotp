@@ -36,6 +36,32 @@ func TestBuildRejectsUnknownLauncher(t *testing.T) {
 	}
 }
 
+func TestBuildMasterModeUsesExactArguments(t *testing.T) {
+	wantArgs := []string{"-N", "-o", "ServerAliveInterval=60", "-o", "ServerAliveCountMax=3", "-o", "ControlPersist=no", "example-one"}
+	tests := []struct {
+		launcher string
+		want     Spec
+	}{
+		{"ssh", Spec{Executable: "ssh", Args: wantArgs}},
+		{"sshm", Spec{Executable: "sshm", Args: wantArgs}},
+	}
+	for _, test := range tests {
+		got, err := Build(config.EffectiveTarget{Launcher: test.launcher, SSH: "example-one", Master: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, test.want) {
+			t.Fatalf("%s: got %+v, want %+v", test.launcher, got, test.want)
+		}
+	}
+}
+
+func TestBuildRejectsUnknownLauncherInMasterMode(t *testing.T) {
+	if _, err := Build(config.EffectiveTarget{Launcher: "sh", SSH: "example-one", Master: true}); err == nil {
+		t.Fatal("Build succeeded")
+	}
+}
+
 func TestSSHMProcessReplacementCompatibility(t *testing.T) {
 	bin := t.TempDir()
 	writeExecutable(t, filepath.Join(bin, "sshm"), "#!/bin/sh\nexec ssh \"$@\"\n")

@@ -41,6 +41,7 @@ func runInternal(args []string, streams Streams) int {
 		if err != nil {
 			return usageError(streams.Err, err)
 		}
+		target.Master = true
 		input, ok := streams.In.(*os.File)
 		if !ok {
 			fmt.Fprintln(streams.Err, "jumpotp: target wrapper requires an operating-system input stream")
