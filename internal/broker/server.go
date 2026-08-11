@@ -19,6 +19,19 @@ import (
 
 var ErrAlreadyRunning = errors.New("broker is already running")
 
+// Rotation-boundary guard constants, beside the aggregation-window default
+// below (see design.md, "D3: TOTP rotation-boundary guard and bounded
+// resubmission"). The jumpserver-koko preset is 6-digit/30s TOTP, so
+// totpPeriod is asserted rather than derived. A flush with fewer than
+// rotationGuardThreshold left in the current epoch-aligned window waits for
+// the next boundary, plus rotationGuardSkew to absorb clock/provider skew,
+// before invoking the provider.
+const (
+	totpPeriod             = 30 * time.Second
+	rotationGuardThreshold = 8 * time.Second
+	rotationGuardSkew      = 300 * time.Millisecond
+)
+
 type waiter struct {
 	target   config.EffectiveTarget
 	response chan response
@@ -44,6 +57,11 @@ type Server struct {
 	cancel      context.CancelFunc
 	closeOnce   sync.Once
 	handlerWait sync.WaitGroup
+
+	// now and sleep are test seams for the rotation-boundary guard in flush.
+	// nil is never observed outside tests: NewServer always defaults them.
+	now   func() time.Time
+	sleep func(context.Context, time.Duration) bool
 }
 
 func NewServer(cfg *config.Config, profile string, source provider.Source, window time.Duration) (*Server, error) {
@@ -107,6 +125,8 @@ func NewServer(cfg *config.Config, profile string, source provider.Source, windo
 		seen:     map[string]bool{},
 		ctx:      ctx,
 		cancel:   cancel,
+		now:      time.Now,
+		sleep:    waitContext,
 	}, nil
 }
 
@@ -266,6 +286,14 @@ func (s *Server) flush(group string) {
 	if current == nil || first.Target == "" {
 		return
 	}
+	if delay := rotationGuardDelay(s.now()); delay > 0 {
+		if !s.sleep(s.ctx, delay) {
+			// Shutdown ended the wait; Close already delivered the
+			// interruption error to every waiter still in this batch and
+			// cleared it, so there is nothing left for this flush to do.
+			return
+		}
+	}
 	code, err := s.source.Code(s.ctx, first.Item)
 	if err == nil {
 		err = mfa.ValidateCode(code, first.MFA)
@@ -301,6 +329,41 @@ func (s *Server) flush(group string) {
 		wait.response <- response{Version: protocolVersion, Status: "ok", Code: string(code)}
 	}
 	mfa.Zero(code)
+}
+
+// rotationGuardDelay reports how long flush must wait before invoking the
+// provider so the delivered code has usable runway in its TOTP window. It
+// returns 0 when at least rotationGuardThreshold remains in the current
+// epoch-aligned totpPeriod window at now; otherwise it returns the time to
+// the next window boundary plus rotationGuardSkew.
+func rotationGuardDelay(now time.Time) time.Duration {
+	elapsed := time.Duration(now.UnixNano() % int64(totpPeriod))
+	remaining := totpPeriod - elapsed
+	if remaining >= rotationGuardThreshold {
+		return 0
+	}
+	return remaining + rotationGuardSkew
+}
+
+// waitContext is the default sleep seam: it waits for d or ctx.Done(),
+// whichever comes first, and reports whether the wait completed normally.
+func waitContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+			return true
+		}
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func prepareBrokerPaths(socket, lease string) error {

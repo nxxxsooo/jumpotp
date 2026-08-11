@@ -19,8 +19,8 @@ Execution notes: tasks 1.x and 8.x require live infrastructure or repository aut
 
 ## 4. Broker rotation-boundary guard
 
-- [ ] 4.1 Add failing broker tests (injectable clock): a group flush starting with <8s remaining in the epoch-aligned 30s window delays retrieval until the next boundary; a flush with ≥8s runway proceeds immediately; aggregated waiters all receive the post-boundary code; existing grouping, deadlines, and error paths are unchanged.
-- [ ] 4.2 Implement the guard in `internal/broker` flush scheduling with named constants for the 30s period and 8s guard; rerun focused tests to green.
+- [x] 4.1 Add failing broker tests (injectable clock): a group flush starting with <8s remaining in the epoch-aligned 30s window delays retrieval until the next boundary; a flush with ≥8s runway proceeds immediately; aggregated waiters all receive the post-boundary code; existing grouping, deadlines, and error paths are unchanged.
+- [x] 4.2 Implement the guard in `internal/broker` flush scheduling with named constants for the 30s period and 8s guard; rerun focused tests to green.
 
 ## 5. Bounded automatic resubmission
 
