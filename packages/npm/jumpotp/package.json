@@ -1,6 +1,6 @@
 {
   "name": "jumpotp",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Safely assist authorized interactive SSH TOTP prompts",
   "license": "Apache-2.0",
   "repository": {
@@ -25,10 +25,10 @@
     "prepublishOnly": "cd ../../.. && npm run check && npm run packages:audit && ./scripts/scrub.sh"
   },
   "optionalDependencies": {
-    "jumpotp-darwin-arm64": "0.1.3",
-    "jumpotp-darwin-x64": "0.1.3",
-    "jumpotp-linux-arm64": "0.1.3",
-    "jumpotp-linux-x64": "0.1.3"
+    "jumpotp-darwin-arm64": "0.2.0",
+    "jumpotp-darwin-x64": "0.2.0",
+    "jumpotp-linux-arm64": "0.2.0",
+    "jumpotp-linux-x64": "0.2.0"
   },
   "publishConfig": {
     "access": "public",

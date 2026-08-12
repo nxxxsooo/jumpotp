@@ -2,7 +2,7 @@
 
 All notable changes follow Semantic Versioning.
 
-## [Unreleased]
+## [0.2.0] - 2026-08-12
 
 - **Breaking:** workspace target windows no longer present an interactive remote shell. Each target window now holds a sessionless ControlMaster (the wrapper launches `<launcher> -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ControlPersist=no <alias>`) that performs MFA and keeps the connection alive without a remote session for a bastion's interactive-idle reaper to reclaim. Interactive work now goes through an ordinary `ssh <alias>` (or `sshm <alias>`), which reuses the same ControlMaster. No configuration changes are required to migrate; stop typing into target windows and use `ssh <alias>` instead.
 - Supervise each workspace target's launcher child with gated, backed-off reconnection: on a non-operator exit the wrapper retries with exponential backoff (5s doubling to a 300s cap, bounded jitter) and only dials again once a reusable ControlMaster or a validated active broker is confirmed, so an unattended workspace never generates a failed MFA attempt.

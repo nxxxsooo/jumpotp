@@ -1,6 +1,6 @@
 {
   "name": "jumpotp-darwin-x64",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "JumpOTP native binary for macOS x64",
   "license": "Apache-2.0",
   "repository": {
