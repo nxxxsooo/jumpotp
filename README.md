@@ -226,6 +226,18 @@ ControlMaster already owns the path, the sessionless client attaches through
 it without MFA and becomes the master itself only once that external master
 is gone.
 
+Because a sessionless connection produces no remote output once it is up,
+the wrapper reports establishment itself. While an attempt runs, it re-checks
+`ssh -O check` on a short interval and, the first time a ControlMaster is
+confirmed, clears the window and prints one line naming the alias to use for
+interactive work. That clear is what removes the authentication exchange --
+including the code the bastion echoes back, which JumpOTP never prints but
+cannot prevent the endpoint from sending -- from a window that may then sit
+untouched for days. It happens at confirmed establishment rather than at
+submission time because the endpoint's echo is a network round trip that can
+land after the local write returns. An attempt that never reaches a confirmed
+master never clears, so its failure lines remain on screen.
+
 Each target window's wrapper supervises its launcher child. When the child
 exits for any reason other than an operator stop -- `stop`, closing the
 window, or an interrupt -- the wrapper reconnects with exponential backoff
