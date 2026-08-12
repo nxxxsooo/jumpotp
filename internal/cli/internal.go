@@ -58,6 +58,7 @@ func runInternal(args []string, streams Streams) int {
 		sup := supervise.Supervisor{
 			Profile: target.Profile,
 			Target:  target.Target,
+			Alias:   target.SSH,
 			Connect: func(ctx context.Context) supervise.ConnectResult {
 				source := &broker.Client{Socket: brokerSocket, Profile: target.Profile, Target: target.Target}
 				result := terminalproxy.Connect(ctx, terminalproxy.Options{

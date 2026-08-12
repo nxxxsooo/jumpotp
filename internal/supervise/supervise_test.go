@@ -3,9 +3,11 @@ package supervise
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -116,6 +118,63 @@ func (g *countingGate) callCount() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.calls
+}
+
+// boolGate is a settable GateFunc backing: a fake Connect flips it to
+// simulate a ControlMaster becoming reusable mid-attempt, and the
+// establishment probe reads it exactly as the real "ssh -O check" mechanism
+// would.
+type boolGate struct {
+	mu    sync.Mutex
+	value bool
+}
+
+func (g *boolGate) set(v bool) {
+	g.mu.Lock()
+	g.value = v
+	g.mu.Unlock()
+}
+
+func (g *boolGate) check() (bool, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.value, nil
+}
+
+// phraseSignal is an io.Writer test double that accumulates everything
+// written to it and, on notify, delivers one value per new occurrence of
+// phrase in the accumulated text. Tests use it to block a fake Connect
+// until the establishment probe has actually printed its line, instead of
+// racing goroutine scheduling to guess when Connect may safely return.
+type phraseSignal struct {
+	mu     sync.Mutex
+	buf    strings.Builder
+	phrase string
+	seen   int
+	notify chan struct{}
+}
+
+func newPhraseSignal(phrase string) *phraseSignal {
+	return &phraseSignal{phrase: phrase, notify: make(chan struct{}, 8)}
+}
+
+func (s *phraseSignal) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	n, err := s.buf.Write(p)
+	for count := strings.Count(s.buf.String(), s.phrase); count > s.seen; s.seen++ {
+		select {
+		case s.notify <- struct{}{}:
+		default:
+		}
+	}
+	s.mu.Unlock()
+	return n, err
+}
+
+func (s *phraseSignal) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }
 
 func alwaysOpen() (bool, error)   { return true, nil }
@@ -484,6 +543,278 @@ func TestRunReturnsZeroValueWhenAlreadyStoppedBeforeFirstAttempt(t *testing.T) {
 	}
 	if result != (ConnectResult{}) {
 		t.Fatalf("result = %+v, want the zero value", result)
+	}
+}
+
+func TestEstablishProbeReportsOnFirstConfirmation(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	master := &boolGate{}
+	out := newPhraseSignal("master established")
+	// Connect simulates a sessionless launcher: authentication succeeds (the
+	// ControlMaster becomes reusable), then it produces no further output of
+	// its own, so only the probe -- never Connect -- can announce it.
+	connect := &fakeConnect{fn: func(ctx context.Context, call int) ConnectResult {
+		master.set(true)
+		<-out.notify
+		signals <- syscall.SIGTERM
+		<-ctx.Done()
+		return ConnectResult{ExitCode: 0, Err: context.Canceled}
+	}}
+	sup := Supervisor{
+		Profile:      "production",
+		Target:       "app-01",
+		Alias:        "corp-app01",
+		Connect:      connect.Connect,
+		MasterCheck:  master.check,
+		BrokerActive: alwaysOpen,
+		Now:          fixedNow(time.Now()),
+		Sleep:        (&scriptedSleep{}).sleep,
+		Out:          out,
+		Signals:      signals,
+	}
+	sup.Run(context.Background())
+
+	output := out.String()
+	if got := strings.Count(output, "master established"); got != 1 {
+		t.Fatalf("establishment line count = %d, want exactly 1: %q", got, output)
+	}
+	if connect.callCount() != 1 {
+		t.Fatalf("connect calls = %d, want exactly 1", connect.callCount())
+	}
+}
+
+func TestEstablishProbeSilentWhenNeverConfirmed(t *testing.T) {
+	connect := &fakeConnect{fn: func(context.Context, int) ConnectResult {
+		return ConnectResult{ExitCode: 5}
+	}}
+	sleeper := &scriptedSleep{stopAt: 1}
+	var out strings.Builder
+	sup := Supervisor{
+		Profile:      "production",
+		Target:       "app-01",
+		Alias:        "corp-app01",
+		Connect:      connect.Connect,
+		MasterCheck:  alwaysClosed,
+		BrokerActive: alwaysOpen,
+		Now:          fixedNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)),
+		Sleep:        sleeper.sleep,
+		Rand:         func() float64 { return 0.5 },
+		Out:          &out,
+	}
+	sup.Run(context.Background())
+
+	output := out.String()
+	if strings.Contains(output, "master established") {
+		t.Fatalf("unexpected establishment line for an attempt that never confirmed: %q", output)
+	}
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+	last := lines[len(lines)-1]
+	if !strings.Contains(last, "exit code 5") {
+		t.Fatalf("the exit line must remain the last output when nothing confirms: %q", output)
+	}
+}
+
+func TestEstablishProbeReportsAgainOnSecondAttempt(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	master := &boolGate{}
+	master.set(true) // already confirmed before either attempt starts
+	out := newPhraseSignal("master established")
+	connect := &fakeConnect{fn: func(ctx context.Context, call int) ConnectResult {
+		<-out.notify // wait for this attempt's own establishment line
+		if call == 1 {
+			return ConnectResult{ExitCode: 1} // child-initiated exit -> reconnect
+		}
+		signals <- syscall.SIGTERM
+		<-ctx.Done()
+		return ConnectResult{ExitCode: 0, Err: context.Canceled}
+	}}
+	sup := Supervisor{
+		Profile:     "production",
+		Target:      "app-01",
+		Alias:       "corp-app01",
+		Connect:     connect.Connect,
+		MasterCheck: master.check,
+		Now:         fixedNow(time.Now()),
+		Sleep:       (&scriptedSleep{}).sleep,
+		Rand:        func() float64 { return 0.5 },
+		Out:         out,
+		Signals:     signals,
+	}
+	sup.Run(context.Background())
+
+	output := out.String()
+	if got := strings.Count(output, "master established"); got != 2 {
+		t.Fatalf("establishment line count = %d, want exactly 2 (once per attempt): %q", got, output)
+	}
+	if connect.callCount() != 2 {
+		t.Fatalf("connect calls = %d, want exactly 2", connect.callCount())
+	}
+}
+
+func TestEstablishProbeGoroutineStopsWhenAttemptEnds(t *testing.T) {
+	var calls int64
+	check := func() (bool, error) {
+		atomic.AddInt64(&calls, 1)
+		return false, nil // never confirms, so only ctx cancellation can end the probe
+	}
+	sup := Supervisor{
+		Connect:     func(ctx context.Context) ConnectResult { return ConnectResult{ExitCode: 7} },
+		MasterCheck: check,
+	}
+	result := sup.runAttempt(context.Background(), (&scriptedSleep{}).sleep, io.Discard)
+	if result.ExitCode != 7 {
+		t.Fatalf("runAttempt result = %+v, want Connect's result unchanged", result)
+	}
+
+	countAtReturn := atomic.LoadInt64(&calls)
+	time.Sleep(20 * time.Millisecond) // brief real wait: proves nothing keeps calling MasterCheck
+	if got := atomic.LoadInt64(&calls); got != countAtReturn {
+		t.Fatalf("MasterCheck calls grew from %d to %d after runAttempt returned: the probe outlived the attempt", countAtReturn, got)
+	}
+}
+
+func TestEstablishmentLineNamesAliasAndStaysRedacted(t *testing.T) {
+	const secretCode = "000000"
+	const secretItem = "Example Bitwarden Item"
+	signals := make(chan os.Signal, 1)
+	master := &boolGate{}
+	out := newPhraseSignal("master established")
+	connect := &fakeConnect{fn: func(ctx context.Context, call int) ConnectResult {
+		master.set(true)
+		<-out.notify
+		signals <- syscall.SIGTERM
+		<-ctx.Done()
+		return ConnectResult{ExitCode: 0, Err: context.Canceled}
+	}}
+	sup := Supervisor{
+		Profile:      "production",
+		Target:       "app-01",
+		Alias:        "corp-app01",
+		Connect:      connect.Connect,
+		MasterCheck:  master.check,
+		BrokerActive: alwaysOpen,
+		Now:          fixedNow(time.Now()),
+		Sleep:        (&scriptedSleep{}).sleep,
+		Out:          out,
+		Signals:      signals,
+	}
+	sup.Run(context.Background())
+
+	output := out.String()
+	if !strings.Contains(output, "master established; interactive work goes through ssh corp-app01") {
+		t.Fatalf("missing or malformed establishment line: %q", output)
+	}
+	if !strings.Contains(output, "production/app-01") {
+		t.Fatalf("establishment output missing the profile/target label: %q", output)
+	}
+	if strings.Contains(output, secretCode) {
+		t.Fatalf("establishment output leaked a code-shaped value: %q", output)
+	}
+	if strings.Contains(output, secretItem) || strings.Contains(strings.ToLower(output), "item") {
+		t.Fatalf("establishment output leaked an item reference: %q", output)
+	}
+	for _, token := range []string{"-N", "-o", "ServerAliveInterval", "ControlPersist"} {
+		if strings.Contains(output, token) {
+			t.Fatalf("establishment output leaked a raw ssh argument %q: %q", token, output)
+		}
+	}
+}
+
+func TestEstablishProbeClearsScreenImmediatelyBeforeEstablishmentLine(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	master := &boolGate{}
+	out := newPhraseSignal("master established")
+	connect := &fakeConnect{fn: func(ctx context.Context, call int) ConnectResult {
+		master.set(true)
+		<-out.notify
+		signals <- syscall.SIGTERM
+		<-ctx.Done()
+		return ConnectResult{ExitCode: 0, Err: context.Canceled}
+	}}
+	sup := Supervisor{
+		Profile:      "production",
+		Target:       "app-01",
+		Alias:        "corp-app01",
+		Connect:      connect.Connect,
+		MasterCheck:  master.check,
+		BrokerActive: alwaysOpen,
+		Now:          fixedNow(time.Now()),
+		Sleep:        (&scriptedSleep{}).sleep,
+		Out:          out,
+		Signals:      signals,
+	}
+	sup.Run(context.Background())
+
+	output := out.String()
+	want := clearScreenSequence + "jumpotp: [production/app-01] master established"
+	if !strings.Contains(output, want) {
+		t.Fatalf("clear sequence must immediately precede the establishment line: %q", output)
+	}
+	if strings.Count(output, clearScreenSequence) != 1 {
+		t.Fatalf("clear sequence count = %d, want exactly 1: %q", strings.Count(output, clearScreenSequence), output)
+	}
+}
+
+func TestEstablishProbeNeverClearsWhenNotConfirmed(t *testing.T) {
+	connect := &fakeConnect{fn: func(context.Context, int) ConnectResult {
+		return ConnectResult{ExitCode: 5}
+	}}
+	sleeper := &scriptedSleep{stopAt: 1}
+	var out strings.Builder
+	sup := Supervisor{
+		Profile:      "production",
+		Target:       "app-01",
+		Alias:        "corp-app01",
+		Connect:      connect.Connect,
+		MasterCheck:  alwaysClosed,
+		BrokerActive: alwaysOpen,
+		Now:          fixedNow(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)),
+		Sleep:        sleeper.sleep,
+		Rand:         func() float64 { return 0.5 },
+		Out:          &out,
+	}
+	sup.Run(context.Background())
+
+	output := out.String()
+	if strings.Contains(output, clearScreenSequence) {
+		t.Fatalf("unexpected screen clear for an attempt that never confirmed: %q", output)
+	}
+}
+
+func TestEstablishProbeClearsAtMostOnceEachAttempt(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	master := &boolGate{}
+	master.set(true) // already confirmed before either attempt starts
+	out := newPhraseSignal("master established")
+	connect := &fakeConnect{fn: func(ctx context.Context, call int) ConnectResult {
+		<-out.notify // wait for this attempt's own establishment line (and clear)
+		if call == 1 {
+			return ConnectResult{ExitCode: 1} // child-initiated exit -> reconnect
+		}
+		signals <- syscall.SIGTERM
+		<-ctx.Done()
+		return ConnectResult{ExitCode: 0, Err: context.Canceled}
+	}}
+	sup := Supervisor{
+		Profile:     "production",
+		Target:      "app-01",
+		Alias:       "corp-app01",
+		Connect:     connect.Connect,
+		MasterCheck: master.check,
+		Now:         fixedNow(time.Now()),
+		Sleep:       (&scriptedSleep{}).sleep,
+		Rand:        func() float64 { return 0.5 },
+		Out:         out,
+		Signals:     signals,
+	}
+	sup.Run(context.Background())
+
+	output := out.String()
+	if got := strings.Count(output, clearScreenSequence); got != 2 {
+		t.Fatalf("clear sequence count = %d, want exactly 2 (once per attempt, never more): %q", got, output)
+	}
+	if got := strings.Count(output, "master established"); got != 2 {
+		t.Fatalf("establishment line count = %d, want exactly 2, matching the clear count: %q", got, output)
 	}
 }
 

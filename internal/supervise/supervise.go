@@ -33,6 +33,23 @@ type ConnectFunc func(ctx context.Context) ConnectResult
 // An error is treated the same as a false result: the gate stays closed.
 type GateFunc func() (bool, error)
 
+// clearScreenSequence homes the cursor, erases the visible screen, then
+// erases the terminal's scrollback, in that order: homing first anchors the
+// erases that follow to a known position, and the display erase (2J) is
+// issued before the scrollback erase (3J) since some terminals interpret 3J
+// relative to what is already on screen. Written to the wrapper's own
+// output stream only once MasterCheck first confirms the ControlMaster is
+// established -- never at the moment a code is submitted, because the
+// endpoint's echo of that code is a network round trip and is not
+// guaranteed to have arrived by then. Confirmed establishment is the first
+// point at which the whole authentication exchange, including any echo, is
+// certain to have already landed, so clearing there (immediately before the
+// establishment line) replaces it for good. An attempt that never confirms
+// a master never clears, so its failure evidence stays on screen. This is a
+// terminal control sequence on JumpOTP's own output stream, never a tmux
+// mechanism.
+const clearScreenSequence = "\033[H\033[2J\033[3J"
+
 const (
 	// InitialBackoff is the delay before the first reconnect attempt after a
 	// child-initiated exit.
@@ -42,6 +59,11 @@ const (
 	// GatePollInterval is how often the reconnect gate is re-checked while
 	// closed. No jitter applies to gate polling, only to reconnect backoff.
 	GatePollInterval = 10 * time.Second
+	// EstablishProbeInterval is how often, while an attempt is running, the
+	// wrapper re-checks MasterCheck to catch the moment a sessionless
+	// connection's ControlMaster becomes established. Kept shorter than
+	// GatePollInterval so the first confirmation is reported promptly.
+	EstablishProbeInterval = 2 * time.Second
 	// StableConnection is how long an attempt must run before its end resets
 	// backoff back to InitialBackoff instead of continuing to double. Chosen
 	// conservatively; neither design.md nor spec.md pins an exact figure for
@@ -65,6 +87,10 @@ type Supervisor struct {
 	// reference, neither of which may appear in supervisor output.
 	Profile string
 	Target  string
+	// Alias is the target's SSH alias, printed in the establishment status
+	// line as what to run for interactive work (e.g. "ssh <Alias>"). It
+	// must be the resolved SSH alias, never a Bitwarden item reference.
+	Alias string
 
 	// Connect performs one connection attempt. Required.
 	Connect ConnectFunc
@@ -154,7 +180,7 @@ func (s Supervisor) Run(ctx context.Context) ConnectResult {
 		}
 		s.logf(out, "connecting")
 		attemptStart := now()
-		result := s.Connect(stopCtx)
+		result := s.runAttempt(stopCtx, sleep, out)
 		last = result
 		if stopCtx.Err() != nil {
 			// Operator stop ended the in-flight attempt; Connect's own
@@ -176,6 +202,53 @@ func (s Supervisor) Run(ctx context.Context) ConnectResult {
 			backoff = InitialBackoff
 		} else {
 			backoff = nextBackoff(backoff)
+		}
+	}
+}
+
+// runAttempt runs Connect for one attempt while a concurrent goroutine
+// probes MasterCheck on EstablishProbeInterval to report the moment a
+// ControlMaster becomes established. The probe is always canceled and
+// joined before this returns -- whether Connect ended because ctx was
+// canceled or because the child process exited on its own -- so it never
+// outlives the attempt and its writes to out never race the caller's next
+// status line.
+func (s Supervisor) runAttempt(ctx context.Context, sleep func(context.Context, time.Duration) bool, out io.Writer) ConnectResult {
+	if s.MasterCheck == nil {
+		return s.Connect(ctx)
+	}
+	probeCtx, probeCancel := context.WithCancel(ctx)
+	probeDone := make(chan struct{})
+	go func() {
+		defer close(probeDone)
+		s.runEstablishProbe(probeCtx, sleep, out)
+	}()
+	result := s.Connect(ctx)
+	probeCancel()
+	<-probeDone
+	return result
+}
+
+// runEstablishProbe re-checks MasterCheck on EstablishProbeInterval while an
+// attempt is in flight. On first confirmation it clears the screen (see
+// clearScreenSequence) and then prints the establishment line -- in that
+// order, so the line is what survives as visible content -- and returns
+// immediately after, so it can never report (or clear) more than once per
+// attempt; a fresh probe goroutine runs for every attempt, so a later
+// attempt reports again. Establishment is read only from MasterCheck, never
+// inferred from remote output.
+func (s Supervisor) runEstablishProbe(ctx context.Context, sleep func(context.Context, time.Duration) bool, out io.Writer) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if s.masterConfirmed() {
+			io.WriteString(out, clearScreenSequence)
+			s.logf(out, "master established; interactive work goes through ssh %s", s.Alias)
+			return
+		}
+		if !sleep(ctx, EstablishProbeInterval) {
+			return
 		}
 	}
 }
@@ -210,10 +283,8 @@ func (s Supervisor) waitForGate(ctx context.Context, now func() time.Time, sleep
 // MasterCheck short-circuits: BrokerActive is not consulted when a reusable
 // master already answers.
 func (s Supervisor) gateOpen() bool {
-	if s.MasterCheck != nil {
-		if ok, _ := s.MasterCheck(); ok {
-			return true
-		}
+	if s.masterConfirmed() {
+		return true
 	}
 	if s.BrokerActive != nil {
 		if ok, _ := s.BrokerActive(); ok {
@@ -221,6 +292,17 @@ func (s Supervisor) gateOpen() bool {
 		}
 	}
 	return false
+}
+
+// masterConfirmed reports whether MasterCheck currently confirms a reusable
+// ControlMaster. A nil MasterCheck, or a check that errors, both count as
+// not confirmed.
+func (s Supervisor) masterConfirmed() bool {
+	if s.MasterCheck == nil {
+		return false
+	}
+	ok, _ := s.MasterCheck()
+	return ok
 }
 
 func (s Supervisor) label() string {
