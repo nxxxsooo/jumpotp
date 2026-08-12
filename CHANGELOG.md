@@ -2,7 +2,7 @@
 
 All notable changes follow Semantic Versioning.
 
-## [Unreleased]
+## [0.2.1] - 2026-08-12
 
 - Report `master established` in each workspace target window once a reusable ControlMaster is confirmed, naming the alias to use for interactive work. A sessionless target produces no remote output after authentication, so a healthy connection previously looked identical to a hung one.
 - Clear the target window and its scrollback at that same confirmed-establishment moment, removing the authentication exchange — including the code the endpoint echoes back, which JumpOTP never prints but cannot prevent — from a window that may sit unattended for days. Clearing writes only terminal control sequences to JumpOTP's own output stream and still never uses `capture-pane`, `send-keys`, or any tmux buffer mechanism. An attempt that never confirms a master never clears, preserving its failure evidence.
