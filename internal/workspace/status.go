@@ -100,14 +100,17 @@ func (m Manager) Status(ctx context.Context, profileFilter string) (StatusReport
 		targetNames := sortedTargets(profileConfig.Targets)
 		for _, targetName := range targetNames {
 			targetState := "stopped"
+			master := m.controlMasterState(ctx, profileConfig.Targets[targetName].SSH)
 			if fields, ok := windowByTarget[targetName]; ok {
-				if fields[1] == "1" || fields[2] != targetName {
+				switch {
+				case fields[1] == "1" || fields[2] != targetName:
 					targetState = "failed"
-				} else {
+				case master == "unavailable":
+					targetState = "connecting"
+				default:
 					targetState = "running"
 				}
 			}
-			master := m.controlMasterState(ctx, profileConfig.Targets[targetName].SSH)
 			status.Targets = append(status.Targets, TargetStatus{Target: targetName, State: targetState, ControlMaster: master})
 		}
 		if profileConfig.Workspace != nil && profileConfig.Workspace.Health != nil && profileConfig.Workspace.Health.Enabled && status.Health == "disabled" {

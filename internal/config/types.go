@@ -117,6 +117,7 @@ type EffectiveTarget struct {
 	Fallback string
 	MFA      MFA
 	Manual   bool
+	Master   bool
 	Health   EffectiveHealth
 }
 

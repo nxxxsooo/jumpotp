@@ -12,6 +12,7 @@ import (
 )
 
 const defaultClientTimeout = provider.DefaultTimeout + 2*time.Second
+const defaultConnectionTimeout = provider.DefaultTimeout + 5*time.Second
 
 type Client struct {
 	Socket  string
@@ -62,17 +63,24 @@ func (c *Client) Code(ctx context.Context, _ string) ([]byte, error) {
 		return nil, &provider.Error{Kind: provider.Failed}
 	}
 	if result.Version != protocolVersion || result.Status != "ok" {
-		kind := provider.Kind(result.Kind)
-		switch kind {
-		case provider.Unavailable, provider.Locked, provider.Missing, provider.Ambiguous, provider.Invalid, provider.TimedOut, provider.Interrupted:
-		default:
-			kind = provider.Failed
-		}
-		return nil, &provider.Error{Kind: kind}
+		return nil, responseError(result)
 	}
 	code := []byte(result.Code)
 	result.Code = ""
 	return code, nil
+}
+
+func responseError(result response) error {
+	kind := provider.Kind(result.Kind)
+	switch kind {
+	case provider.Unavailable, provider.Locked, provider.Missing, provider.Ambiguous, provider.Invalid, provider.TimedOut, provider.Interrupted:
+	default:
+		kind = provider.Failed
+	}
+	if result.ElapsedSeconds != nil {
+		return provider.NewMeasuredError(kind, *result.ElapsedSeconds)
+	}
+	return &provider.Error{Kind: kind}
 }
 
 func (c *Client) AwaitCode(ctx context.Context, item string) ([]byte, error) {

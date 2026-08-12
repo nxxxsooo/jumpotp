@@ -21,11 +21,12 @@ type request struct {
 }
 
 type response struct {
-	Version int    `json:"version"`
-	Status  string `json:"status"`
-	Kind    string `json:"kind,omitempty"`
-	Message string `json:"message,omitempty"`
-	Code    string `json:"code,omitempty"`
+	Version        int    `json:"version"`
+	Status         string `json:"status"`
+	Kind           string `json:"kind,omitempty"`
+	Message        string `json:"message,omitempty"`
+	Code           string `json:"code,omitempty"`
+	ElapsedSeconds *int   `json:"elapsed_seconds,omitempty"`
 }
 
 func writeFrame(writer io.Writer, value any) error {

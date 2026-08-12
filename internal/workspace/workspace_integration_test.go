@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -154,6 +155,99 @@ func TestUnexpectedTargetPaneIsPreserved(t *testing.T) {
 	}
 }
 
+// TestSupervisedWrapperOutlivesChildExitAndReconcileStaysHealthy exercises
+// the pane-level contract that internal/supervise.Supervisor's reconnect
+// loop depends on: reconcileSession decides pane health from tmux's own
+// pane_dead/marker state, not from whether the wrapper's inner launcher
+// child is still running. It simulates the supervisor (see design.md, "D2:
+// Supervised reconnection in the target wrapper") with a plain shell wrapper
+// that runs a short-lived "child" and then keeps the pane's process alive --
+// exactly as Supervisor.Run does while backing off or waiting on the
+// reconnect gate -- rather than driving the real supervisor binary and ssh
+// inside tmux, which is impractical here; internal/supervise/supervise_test.go
+// covers the actual backoff/gate/signal state machine at the unit level.
+func TestSupervisedWrapperOutlivesChildExitAndReconcileStaysHealthy(t *testing.T) {
+	requireTmux(t)
+	useWorkspaceRuntime(t)
+	cfg, wrapper := supervisedWrapperFixture(t)
+	manager := Manager{Config: cfg, Executable: wrapper}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	brokerSocket := filepath.Join(t.TempDir(), "broker.sock")
+	if err := manager.Ensure(ctx, "production", "", false, brokerSocket); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = manager.Stop(context.Background(), "production") })
+	socket, _, err := manager.Paths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforePaneID := paneID(t, socket, "production:app-01")
+
+	// Give the simulated child time to exit inside the wrapper while the
+	// wrapper's own process (the pane's process, from tmux's perspective)
+	// keeps running -- the property a live supervised reconnect depends on.
+	time.Sleep(2 * time.Second)
+
+	if dead := paneField(t, socket, "production:app-01", "#{pane_dead}"); dead != "0" {
+		t.Fatalf("pane_dead = %q, want the pane alive after the simulated child exited", dead)
+	}
+
+	if err := manager.Ensure(ctx, "production", "", false, brokerSocket); err != nil {
+		t.Fatalf("reconcileSession over a live supervised pane: %v", err)
+	}
+
+	if afterPaneID := paneID(t, socket, "production:app-01"); afterPaneID != beforePaneID {
+		t.Fatalf("pane id changed from %q to %q; reconcileSession recreated a live supervised window instead of leaving it alone", beforePaneID, afterPaneID)
+	}
+}
+
+// TestReconcileSessionRejectsGenuinelyDeadPane covers the fail-closed branch
+// of reconcileSession that TestUnexpectedTargetPaneIsPreserved does not: a
+// pane whose process has actually exited (pane_dead=1), as opposed to a live
+// pane carrying an unexpected @jumpotp_target marker. tmux only keeps a dead
+// pane's window around (rather than closing it immediately) when
+// remain-on-exit is enabled, so the test sets that window option before
+// killing the wrapper process to put reconcileSession's dead-pane check on a
+// real code path.
+func TestReconcileSessionRejectsGenuinelyDeadPane(t *testing.T) {
+	requireTmux(t)
+	useWorkspaceRuntime(t)
+	cfg, wrapper := workspaceFixture(t)
+	manager := Manager{Config: cfg, Executable: wrapper}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	brokerSocket := filepath.Join(t.TempDir(), "broker.sock")
+	if err := manager.Ensure(ctx, "production", "", false, brokerSocket); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Stop(context.Background(), "production")
+	socket, _, err := manager.Paths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("tmux", "-S", socket, "set-option", "-w", "-t", "production:app-01", "remain-on-exit", "on").CombinedOutput(); err != nil {
+		t.Fatalf("set remain-on-exit: %v: %s", err, output)
+	}
+	panePID, err := strconv.Atoi(paneField(t, socket, "production:app-01", "#{pane_pid}"))
+	if err != nil {
+		t.Fatalf("parse pane pid: %v", err)
+	}
+	if err := syscall.Kill(panePID, syscall.SIGKILL); err != nil {
+		t.Fatalf("kill wrapper pane process: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for paneField(t, socket, "production:app-01", "#{pane_dead}") != "1" {
+		if time.Now().After(deadline) {
+			t.Fatal("pane never reported dead after the wrapper process was killed")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := manager.Ensure(ctx, "production", "", false, brokerSocket); err == nil || !strings.Contains(err.Error(), "refusing to replace") {
+		t.Fatalf("Ensure error = %v, want a fail-closed refusal for a genuinely dead pane", err)
+	}
+}
+
 func requireTmux(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("tmux"); err != nil {
@@ -187,6 +281,45 @@ func workspaceFixture(t *testing.T) (*config.Config, string) {
 		t.Fatal(err)
 	}
 	return cfg, wrapper
+}
+
+// supervisedWrapperFixture builds a workspace whose target command simulates
+// a supervised __target wrapper: a short-lived "child" (the first sleep,
+// standing in for a launcher connection that ends on its own) exits on its
+// own, and the wrapper keeps the pane's process alive afterward exactly as
+// internal/supervise.Supervisor does while backing off or waiting on the
+// reconnect gate, instead of letting the pane die with it.
+func supervisedWrapperFixture(t *testing.T) (*config.Config, string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(config.Sample), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(dir, "wrapper")
+	script := "#!/bin/sh\nsleep 1\nexec sleep 30\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return cfg, wrapper
+}
+
+func paneID(t *testing.T, socket, target string) string {
+	t.Helper()
+	return paneField(t, socket, target, "#{pane_id}")
+}
+
+func paneField(t *testing.T, socket, target, format string) string {
+	t.Helper()
+	output, err := exec.Command("tmux", "-S", socket, "display-message", "-p", "-t", target, format).CombinedOutput()
+	if err != nil {
+		t.Fatalf("read %s for %s: %v: %s", format, target, err, output)
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func defaultTmuxStatus() string {

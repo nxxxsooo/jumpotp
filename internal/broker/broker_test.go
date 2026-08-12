@@ -75,6 +75,7 @@ func TestBrokerGroupsReadyTargetsAndRefreshesLateTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	disableRotationGuard(server)
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(context.Background()) }()
 	defer func() {
@@ -114,8 +115,97 @@ func TestBrokerGroupsReadyTargetsAndRefreshesLateTarget(t *testing.T) {
 }
 
 func TestDefaultClientTimeoutCoversProviderBudget(t *testing.T) {
-	if defaultClientTimeout <= provider.DefaultTimeout {
-		t.Fatalf("client timeout %v must exceed provider timeout %v", defaultClientTimeout, provider.DefaultTimeout)
+	if margin := defaultClientTimeout - provider.DefaultTimeout; margin != 2*time.Second {
+		t.Fatalf("client timeout margin = %v, want 2s", margin)
+	}
+	if margin := defaultConnectionTimeout - provider.DefaultTimeout; margin != 5*time.Second {
+		t.Fatalf("connection timeout margin = %v, want 5s", margin)
+	}
+}
+
+func TestActiveDetectsValidatedLiveBroker(t *testing.T) {
+	useShortRuntimeDir(t)
+	server, err := NewServer(sampleConfig(t), "production", &recordingSource{code: "246810"}, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	active, err := Active("production")
+	if err != nil || !active {
+		t.Fatalf("active = %v, err = %v", active, err)
+	}
+}
+
+func TestActiveReportsAbsentAndStaleBrokerAsInactive(t *testing.T) {
+	useShortRuntimeDir(t)
+	active, err := Active("production")
+	if err != nil || active {
+		t.Fatalf("absent active = %v, err = %v", active, err)
+	}
+	dir, err := runtimepath.SecureDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(dir, "broker-production.sock")
+	lease := filepath.Join(dir, "broker-production.lease")
+	if err := runtimepath.WriteLease(lease, runtimepath.Lease{
+		Kind:    "broker",
+		Profile: "production",
+		Socket:  socket,
+		Identity: runtimepath.Identity{
+			PID:        99999,
+			UID:        uint32(os.Getuid()),
+			Start:      "stale",
+			Executable: "jumpotp",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	active, err = Active("production")
+	if err != nil || active {
+		t.Fatalf("stale active = %v, err = %v", active, err)
+	}
+}
+
+func TestActiveRejectsConflictingBrokerState(t *testing.T) {
+	useShortRuntimeDir(t)
+	dir, err := runtimepath.SecureDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(dir, "broker-production.sock")
+	lease := filepath.Join(dir, "broker-production.lease")
+	identity, err := runtimepath.CurrentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtimepath.WriteLease(lease, runtimepath.Lease{
+		Kind:     "tmux",
+		Profile:  "other",
+		Socket:   socket,
+		Identity: identity,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := Active("production"); err == nil || active {
+		t.Fatalf("conflicting active = %v, err = %v", active, err)
+	}
+}
+
+func TestActiveRejectsSocketWithoutValidatedLease(t *testing.T) {
+	useShortRuntimeDir(t)
+	dir, err := runtimepath.SecureDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(dir, "broker-production.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if active, err := Active("production"); err == nil || active {
+		t.Fatalf("unleased active = %v, err = %v", active, err)
 	}
 }
 
@@ -127,6 +217,7 @@ func TestBrokerSharesInFlightFetchWithLaterReadyTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	disableRotationGuard(server)
 	go server.Serve(context.Background())
 	defer server.Close()
 
@@ -166,6 +257,7 @@ func TestTargetOverrideUsesSeparateGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	disableRotationGuard(server)
 	go server.Serve(context.Background())
 	defer server.Close()
 	var wait sync.WaitGroup
@@ -194,6 +286,7 @@ func TestBrokerRejectsWrongTargetAndDuplicateNonce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	disableRotationGuard(server)
 	go server.Serve(context.Background())
 	defer server.Close()
 
@@ -256,12 +349,60 @@ func TestProviderFailureIsRedacted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	disableRotationGuard(server)
 	go server.Serve(context.Background())
 	defer server.Close()
 	client := &Client{Socket: server.Socket(), Profile: "production", Target: "app-01", Timeout: time.Second}
 	_, err = client.Code(context.Background(), "ignored")
 	if err == nil || err.Error() == "private provider detail" {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestBrokerPreservesMeasuredProviderTiming(t *testing.T) {
+	useShortRuntimeDir(t)
+	source := &recordingSource{err: provider.NewMeasuredError(provider.TimedOut, 7)}
+	server, err := NewServer(sampleConfig(t), "production", source, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disableRotationGuard(server)
+	go server.Serve(context.Background())
+	defer server.Close()
+	client := &Client{Socket: server.Socket(), Profile: "production", Target: "app-01", Timeout: time.Second}
+	_, err = client.Code(context.Background(), "ignored")
+	if got := provider.SafeMessage(err); got != "Bitwarden TOTP retrieval timed out after 7s" {
+		t.Fatalf("safe message = %q", got)
+	}
+}
+
+func TestBrokerResponseTimingIsOptionalBoundedAndMessageIndependent(t *testing.T) {
+	seven := 7
+	negative := -1
+	tooLarge := 21
+	tests := []struct {
+		name    string
+		seconds *int
+		want    string
+	}{
+		{name: "valid", seconds: &seven, want: "Bitwarden TOTP retrieval timed out after 7s"},
+		{name: "absent", want: "Bitwarden TOTP retrieval timed out"},
+		{name: "negative", seconds: &negative, want: "Bitwarden TOTP retrieval timed out"},
+		{name: "above deadline", seconds: &tooLarge, want: "Bitwarden TOTP retrieval timed out"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := responseError(response{
+				Version:        protocolVersion,
+				Status:         "error",
+				Kind:           string(provider.TimedOut),
+				Message:        "private item and provider output",
+				ElapsedSeconds: test.seconds,
+			})
+			if got := provider.SafeMessage(err); got != test.want {
+				t.Fatalf("safe message = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
@@ -290,6 +431,7 @@ func TestClientReconnectsWhenBrokerAppearsLater(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	disableRotationGuard(server)
 	go server.Serve(context.Background())
 	defer server.Close()
 	select {
@@ -299,6 +441,248 @@ func TestClientReconnectsWhenBrokerAppearsLater(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("client did not reconnect")
+	}
+}
+
+// guardProbe is both a provider.Source and a target for the sleep test seam,
+// so a single mutex guards every observation a guard test makes: the call
+// order between "sleep" and "provider", and the delay the sleep seam saw.
+// This mirrors recordingSource's pattern of only ever reading captured state
+// back out through the same lock that guards the write.
+type guardProbe struct {
+	mu    sync.Mutex
+	log   []string
+	delay time.Duration
+	code  string
+}
+
+func (p *guardProbe) recordSleep(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.delay = d
+	p.log = append(p.log, "sleep")
+}
+
+func (p *guardProbe) Code(_ context.Context, _ string) ([]byte, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.log = append(p.log, "provider")
+	return []byte(p.code), nil
+}
+
+func (p *guardProbe) snapshot() (log []string, delay time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.log...), p.delay
+}
+
+// epochSecond builds a wall-clock time whose position within the 30-second
+// TOTP window is exactly second, so tests can pick deterministic remaining
+// runway without depending on the real clock.
+func epochSecond(second int) time.Time {
+	return time.Unix(int64(second), 0)
+}
+
+// disableRotationGuard pins server's now seam to the start of a TOTP window,
+// so flush never observes a real, wall-clock-dependent rotation-boundary
+// delay. Pre-existing tests that don't exercise the guard use this so their
+// short client timeouts aren't at the mercy of when in a real 30-second
+// window the test happens to run.
+func disableRotationGuard(server *Server) {
+	server.now = func() time.Time { return epochSecond(0) }
+}
+
+func TestFlushDelaysRetrievalWhenLessThanGuardThresholdRemains(t *testing.T) {
+	useShortRuntimeDir(t)
+	cfg := sampleConfig(t)
+	source := &guardProbe{code: "246810"}
+	server, err := NewServer(cfg, "production", source, 5*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Second 27 of the window leaves 3s of runway, under the 8s guard
+	// threshold, so flush must wait 3s + the 300ms skew allowance.
+	server.now = func() time.Time { return epochSecond(27) }
+	wantDelay := 3*time.Second + rotationGuardSkew
+	server.sleep = func(ctx context.Context, d time.Duration) bool {
+		source.recordSleep(d)
+		return true
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(context.Background()) }()
+	defer func() {
+		_ = server.Close()
+		<-serveDone
+	}()
+
+	client := &Client{Socket: server.Socket(), Profile: "production", Target: "app-01", Nonce: "guard-delay", Timeout: time.Second}
+	code, err := client.Code(context.Background(), "ignored")
+	if err != nil || string(code) != "246810" {
+		t.Fatalf("code = %q, err = %v", code, err)
+	}
+	log, gotDelay := source.snapshot()
+	if gotDelay != wantDelay {
+		t.Fatalf("guard delay = %v, want %v", gotDelay, wantDelay)
+	}
+	if len(log) != 2 || log[0] != "sleep" || log[1] != "provider" {
+		t.Fatalf("call order = %#v, want [sleep provider]", log)
+	}
+}
+
+func TestFlushSkipsDelayWithSufficientRunway(t *testing.T) {
+	useShortRuntimeDir(t)
+	cfg := sampleConfig(t)
+	source := &guardProbe{code: "246810"}
+	server, err := NewServer(cfg, "production", source, 5*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Second 10 of the window leaves 20s of runway, at or above the 8s
+	// guard threshold, so flush must fetch immediately without waiting.
+	server.now = func() time.Time { return epochSecond(10) }
+	sleepCalled := false
+	server.sleep = func(ctx context.Context, d time.Duration) bool {
+		sleepCalled = true
+		return true
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(context.Background()) }()
+	defer func() {
+		_ = server.Close()
+		<-serveDone
+	}()
+
+	client := &Client{Socket: server.Socket(), Profile: "production", Target: "app-01", Nonce: "no-guard-delay", Timeout: time.Second}
+	code, err := client.Code(context.Background(), "ignored")
+	if err != nil || string(code) != "246810" {
+		t.Fatalf("code = %q, err = %v", code, err)
+	}
+	if sleepCalled {
+		t.Fatal("sleep seam was invoked despite sufficient runway")
+	}
+	log, _ := source.snapshot()
+	if len(log) != 1 || log[0] != "provider" {
+		t.Fatalf("call order = %#v, want [provider]", log)
+	}
+}
+
+func TestFlushGuardDelayDeliversCodeToAllAggregatedWaiters(t *testing.T) {
+	useShortRuntimeDir(t)
+	cfg := sampleConfig(t)
+	source := &guardProbe{code: "246810"}
+	server, err := NewServer(cfg, "production", source, 40*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.now = func() time.Time { return epochSecond(25) }
+	server.sleep = func(ctx context.Context, d time.Duration) bool {
+		source.recordSleep(d)
+		return true
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(context.Background()) }()
+	defer func() {
+		_ = server.Close()
+		<-serveDone
+	}()
+
+	type result struct {
+		code string
+		err  error
+	}
+	results := make(chan result, 2)
+	for _, nonce := range []string{"a", "b"} {
+		go func(nonce string) {
+			client := &Client{Socket: server.Socket(), Profile: "production", Target: "app-01", Nonce: nonce, Timeout: time.Second}
+			code, err := client.Code(context.Background(), "ignored")
+			results <- result{code: string(code), err: err}
+		}(nonce)
+	}
+	for range 2 {
+		got := <-results
+		if got.err != nil || got.code != "246810" {
+			t.Fatalf("result = %+v", got)
+		}
+	}
+	log, _ := source.snapshot()
+	providerCalls := 0
+	for _, entry := range log {
+		if entry == "provider" {
+			providerCalls++
+		}
+	}
+	if providerCalls != 1 {
+		t.Fatalf("provider calls = %#v, want exactly one call for the whole batch", log)
+	}
+}
+
+func TestFlushGuardWaitUnblocksPromptlyOnShutdown(t *testing.T) {
+	useShortRuntimeDir(t)
+	cfg := sampleConfig(t)
+	source := &recordingSource{code: "246810"}
+	server, err := NewServer(cfg, "production", source, 5*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Second 29 leaves 1s of runway, so the guard schedules a real
+	// (production) wait of 1s + 300ms skew; Close must cut that short.
+	server.now = func() time.Time { return epochSecond(29) }
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(context.Background()) }()
+
+	result := make(chan error, 1)
+	go func() {
+		client := &Client{Socket: server.Socket(), Profile: "production", Target: "app-01", Nonce: "shutdown-during-guard", Timeout: 2 * time.Second}
+		_, err := client.Code(context.Background(), "ignored")
+		result <- err
+	}()
+	// Give the aggregation window time to fire and enter the guard wait
+	// before shutting the broker down.
+	time.Sleep(30 * time.Millisecond)
+	closeStart := time.Now()
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-serveDone
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("expected an interruption error, got nil")
+		}
+		if kind := provider.KindOf(err); kind != provider.Interrupted {
+			t.Fatalf("error kind = %v, want %v", kind, provider.Interrupted)
+		}
+		if elapsed := time.Since(closeStart); elapsed > 500*time.Millisecond {
+			t.Fatalf("shutdown took %v to unblock the guard wait, want well under the 1.3s guard delay", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not unblock the guard wait")
+	}
+	if len(source.calls()) != 0 {
+		t.Fatalf("provider was called despite shutdown during the guard wait: %#v", source.calls())
+	}
+}
+
+func TestRotationGuardDelay(t *testing.T) {
+	tests := []struct {
+		name   string
+		second int
+		want   time.Duration
+	}{
+		{name: "start of window", second: 0, want: 0},
+		{name: "just under threshold boundary", second: 21, want: 0},
+		{name: "exactly at threshold", second: 22, want: 0},
+		{name: "one second inside threshold", second: 23, want: 7*time.Second + rotationGuardSkew},
+		{name: "one second before boundary", second: 29, want: 1*time.Second + rotationGuardSkew},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := rotationGuardDelay(epochSecond(test.second))
+			if got != test.want {
+				t.Fatalf("rotationGuardDelay(second %d) = %v, want %v", test.second, got, test.want)
+			}
+		})
 	}
 }
 
