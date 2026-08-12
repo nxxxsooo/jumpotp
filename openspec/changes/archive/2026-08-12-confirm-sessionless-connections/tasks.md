@@ -18,4 +18,4 @@
 ## 4. Live verification and release (supervising agent)
 
 - [x] 4.1 Rebuild, install, restart the production workspace, and confirm in a real target window that authentication is followed by a cleared screen and an establishment line, and that `ssh <alias>` still reuses the master.
-- [ ] 4.2 Merge, tag 0.2.1, and verify every distribution surface.
+- [x] 4.2 Merge, tag 0.2.1, and verify every distribution surface.
